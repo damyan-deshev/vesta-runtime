@@ -741,6 +741,25 @@ DEFAULT_CONFIG = {
         "max_line_length": 2000,
     },
 
+    # Vesta runtime defaults. Vesta keeps durable run/ledger state as a
+    # product feature of this fork while reusing Hermes surfaces underneath.
+    "vesta": {
+        "retrieval": {
+            "mode": "disciplined",
+            "broad_read_line_threshold": 200,
+            "broad_read_byte_threshold": 20_000,
+            "broad_read_token_threshold": 12_000,
+        },
+        "whole_document": {
+            "token_threshold": 100_000,
+            "max_chunk_tokens": 20_000,
+        },
+        "raw_retention": {
+            "retain_by_default": True,
+            "purge_preserves_manifest": True,
+        },
+    },
+
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
     # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
@@ -3138,7 +3157,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "sessions", "vesta",
 }
 
 # Valid fields inside a custom_providers list entry

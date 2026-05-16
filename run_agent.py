@@ -1938,6 +1938,8 @@ class AIAgent:
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
+
+        self.vesta_run = None
         
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
@@ -2566,6 +2568,26 @@ class AIAgent:
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+
+    def _ensure_vesta_run(self, *, task_id: str | None = None) -> None:
+        """Create the Vesta run lazily at first real conversation turn."""
+        if self.vesta_run is not None:
+            return
+        try:
+            from vesta_runtime import create_run as _vesta_create_run
+
+            self.vesta_run = _vesta_create_run(
+                session_id=self.session_id,
+                parent_session_id=self._parent_session_id,
+                task_id=task_id,
+                workspace_path=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                model=self.model or "",
+                provider=self.provider or "",
+                platform=self.platform or "cli",
+            )
+        except Exception as _vesta_err:
+            self.vesta_run = None
+            logger.debug("Vesta run initialization failed: %s", _vesta_err)
 
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
@@ -10734,6 +10756,16 @@ class AIAgent:
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                 os.environ["HERMES_SESSION_ID"] = self.session_id
                 try:
+                    from vesta_runtime import record_session_rotation as _vesta_record_rotation
+
+                    _vesta_record_rotation(
+                        old_session_id=old_session_id,
+                        new_session_id=self.session_id,
+                        reason="compression",
+                    )
+                except Exception as _vesta_err:
+                    logger.debug("Vesta compression lineage update failed: %s", _vesta_err)
+                try:
                     from gateway.session_context import _SESSION_ID
                     _SESSION_ID.set(self.session_id)
                 except Exception:
@@ -12177,6 +12209,11 @@ class AIAgent:
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
         # child-launch time see the parent's real id, not None.
         self._current_task_id = effective_task_id
+
+        # Vesta run state is created lazily for a real foreground turn, not at
+        # AIAgent construction time, because Hermes also constructs temporary
+        # agents for helpers and background work.
+        self._ensure_vesta_run(task_id=effective_task_id)
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.

@@ -444,7 +444,36 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
+def _vesta_retrieval_policy_applies(resolved_path: str) -> bool:
+    """Return True when a read belongs to the active Vesta workspace/session."""
+
+    try:
+        from vesta_runtime import get_current_run
+
+        run = get_current_run()
+    except Exception:
+        run = None
+    if run is None:
+        return False
+    if os.getenv("HERMES_SESSION_ID"):
+        return True
+    try:
+        Path(resolved_path).resolve(strict=False).relative_to(
+            Path(run.workspace_path).resolve(strict=False)
+        )
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def read_file_tool(
+    path: str,
+    offset: int = 1,
+    limit: int = 500,
+    task_id: str = "default",
+    complete_coverage: bool = False,
+    broad_read_reason: str | None = None,
+) -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -479,11 +508,46 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         if block_error:
             return json.dumps({"error": block_error})
 
+        # ── Vesta locator-first retrieval policy ─────────────────────
+        resolved_str = str(_resolved)
+        _vesta_policy = {"allowed": True, "broad": False}
+        if _vesta_retrieval_policy_applies(resolved_str):
+            try:
+                from vesta_runtime.retrieval import evaluate_read
+
+                _vesta_policy = evaluate_read(
+                    task_id=task_id,
+                    path=path,
+                    resolved_path=resolved_str,
+                    offset=offset,
+                    limit=limit,
+                    complete_coverage=bool(complete_coverage),
+                    broad_read_reason=broad_read_reason,
+                )
+                if not _vesta_policy.get("allowed", True):
+                    return json.dumps({
+                        "error": _vesta_policy["message"],
+                        "vesta_retrieval_policy": {
+                            "mode": _vesta_policy.get("mode"),
+                            "broad_reasons": _vesta_policy.get("broad_reasons", []),
+                            "repair": [
+                                "Run search_files first to locate relevant sections.",
+                                "Use a narrower offset/limit window.",
+                                "Set complete_coverage=true for whole-document work.",
+                                "Provide broad_read_reason when a broad read is deliberate.",
+                            ],
+                        },
+                        "path": path,
+                        "offset": offset,
+                        "limit": limit,
+                    }, ensure_ascii=False)
+            except Exception:
+                logger.debug("Vesta retrieval policy check failed", exc_info=True)
+
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
-        resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -543,6 +607,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
+        try:
+            if _vesta_policy.get("broad"):
+                result_dict.setdefault("_vesta_retrieval", {
+                    "mode": _vesta_policy.get("mode"),
+                    "broad": True,
+                    "broad_reasons": _vesta_policy.get("broad_reasons", []),
+                })
+        except Exception:
+            pass
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -995,6 +1068,21 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content, code_file=True)
         result_dict = result.to_dict()
+        try:
+            from vesta_runtime.retrieval import record_locator
+
+            match_count = None
+            if isinstance(result_dict, dict):
+                match_count = result_dict.get("count") or result_dict.get("total_count")
+            record_locator(
+                task_id=task_id,
+                pattern=pattern,
+                target=target,
+                path=str(path),
+                result_count=match_count,
+            )
+        except Exception:
+            logger.debug("Vesta locator history update failed", exc_info=True)
 
         if count >= 3:
             result_dict["_warning"] = (
@@ -1028,13 +1116,15 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. NOTE: Cannot read images or binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are rejected; use offset and limit to read specific sections of large files. Vesta retrieval policy prefers locator-first reads; for deliberate whole-document work set complete_coverage=true or provide broad_read_reason. NOTE: Cannot read images or binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000}
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000},
+            "complete_coverage": {"type": "boolean", "description": "Set true only when the task requires complete document/file coverage rather than locator-first source retrieval.", "default": False},
+            "broad_read_reason": {"type": "string", "description": "Short reason for a deliberate broad read when locator-first retrieval is insufficient."}
         },
         "required": ["path"]
     }
@@ -1121,7 +1211,14 @@ SEARCH_FILES_SCHEMA = {
 
 def _handle_read_file(args, **kw):
     tid = kw.get("task_id") or "default"
-    return read_file_tool(path=args.get("path", ""), offset=args.get("offset", 1), limit=args.get("limit", 500), task_id=tid)
+    return read_file_tool(
+        path=args.get("path", ""),
+        offset=args.get("offset", 1),
+        limit=args.get("limit", 500),
+        task_id=tid,
+        complete_coverage=bool(args.get("complete_coverage", False)),
+        broad_read_reason=args.get("broad_read_reason") or None,
+    )
 
 
 def _handle_write_file(args, **kw):

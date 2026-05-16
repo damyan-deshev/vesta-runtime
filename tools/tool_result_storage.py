@@ -119,6 +119,50 @@ def _build_persisted_message(
     return msg
 
 
+def _maybe_persist_to_vesta_run(
+    *,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    preview_size: int,
+) -> str | None:
+    """Persist oversized output to the active Vesta run, if one exists."""
+
+    try:
+        from vesta_runtime import capture_raw_output, get_current_run
+
+        # Avoid leaking a previous Vesta test/run context into legacy tool
+        # persistence paths. Real agent turns carry HERMES_SESSION_ID; direct
+        # helper calls without a session should keep Hermes' existing behavior.
+        if not os.getenv("HERMES_SESSION_ID"):
+            return None
+        if get_current_run() is None and not os.getenv("VESTA_RUN_DIR"):
+            return None
+        raw = capture_raw_output(
+            content=content,
+            source=tool_name,
+            tool_use_id=tool_use_id,
+            excerpt_chars=preview_size,
+            session_id=os.getenv("HERMES_SESSION_ID") or None,
+            metadata={"tool_name": tool_name},
+        )
+        preview, has_more = generate_preview(content, max_chars=preview_size)
+        message = _build_persisted_message(
+            preview=preview,
+            has_more=has_more,
+            original_size=len(content),
+            file_path=raw["path"],
+        )
+        message += (
+            "\nVesta raw ref: "
+            f"{raw['raw_ref']} ({raw['hash']})"
+        )
+        return message
+    except Exception as exc:
+        logger.debug("Vesta raw persistence skipped: %s", exc)
+        return None
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -151,6 +195,19 @@ def maybe_persist_tool_result(
 
     if len(content) <= effective_threshold:
         return content
+
+    vesta_message = _maybe_persist_to_vesta_run(
+        content=content,
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        preview_size=config.preview_size,
+    )
+    if vesta_message is not None:
+        logger.info(
+            "Persisted large tool result to Vesta run: %s (%s, %d chars)",
+            tool_name, tool_use_id, len(content),
+        )
+        return vesta_message
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{tool_use_id}.txt"
