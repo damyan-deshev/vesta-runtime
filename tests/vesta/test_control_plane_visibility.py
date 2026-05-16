@@ -66,6 +66,24 @@ def test_control_plane_snapshot_does_not_infer_success_without_finalization(tmp_
     assert "Finalization Status: `accepted`" not in snapshot
 
 
+def test_finalize_run_refreshes_control_plane_snapshot(tmp_path):
+    set_current_run(None)
+    run = create_run(session_id="session_control_auto", workspace_path=tmp_path, run_id="run_control_auto")
+
+    result = write_finalization(
+        objective="Finalize and refresh control plane.",
+        verification="No artifacts required.",
+        session_id="session_control_auto",
+    )
+
+    assert result["verdict"] == "accepted"
+    assert result["control_plane_path"] == str(run.control_plane_path)
+    snapshot = run.control_plane_path.read_text(encoding="utf-8")
+    assert "Snapshot Status: `not_generated`" not in snapshot
+    assert "Finalization Status: `accepted`" in snapshot
+    assert "Primary Hermes Session ID: `session_control_auto`" in snapshot
+
+
 def test_control_plane_snapshot_tool_updates_active_run(tmp_path, monkeypatch):
     set_current_run(None)
     run = create_run(session_id="session_control_tool", workspace_path=tmp_path, run_id="run_control_tool")

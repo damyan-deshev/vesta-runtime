@@ -47,3 +47,34 @@ generation.
 
 Review the implementation diff and decide whether to run broader repository
 tests before committing.
+
+---
+## T09 Rerun — 2026-05-16 21:34
+
+**Entry type:** claim
+**Title:** Vesta is a multi-surface harness, not only a coding-agent wrapper
+**Statement:** Hermes/Vesta supports 16+ messaging platforms, smart home (Home Assistant), and research/media toolsets (web, vision, Spotify, image/video gen, TTS, maps, knowledge management) as non-coding surfaces, alongside CLI/TUI and ACP coding/eval surfaces. Toolset count: 60+ across all categories.
+**Refs:** toolsets.py (get_all_toolsets()), VESTA_PRODUCT_IDEA.md:1-85, VESTA_LEDGER_DESIGN.md:154-248, work/vesta-runtime/prd.md:195-329
+**Artifact:** live-eval-artifacts/t09-vesta-multisurface-smoke-rerun-2026-05-16.md (4164 bytes, exists)
+**Gap:** Vesta runtime discipline (ledger, finalization, artifact tracking) is designed but not yet implemented — harness differentiation is inherited from Hermes, not yet Vesta-original code.
+**Status:** verified
+
+---
+## Runtime Gap Fix Pass — 2026-05-17
+
+**Entry type:** checkpoint
+**Title:** Live-suite runtime gaps implemented with regression coverage
+**Statement:** Added Vesta-native state readers, scenario-aware eval contract profiles, compression check telemetry/debug force hooks, resume recovery lineage, eval fixture/override policy, automatic control-plane refresh on finalization, and validator status header refresh.
+**Refs:** `vesta_runtime/state.py`, `vesta_runtime/eval_contract.py`, `vesta_runtime/eval_policy.py`, `tools/vesta_tools.py`, `tools/file_tools.py`, `run_agent.py`
+**Verification:** `python -m pytest tests/vesta -q` -> 62 passed; `scripts/run_tests.sh tests/vesta` -> 62 passed.
+**Status:** verified
+
+---
+## Worker Aggregation Contract Pass — 2026-05-17
+
+**Entry type:** checkpoint
+**Title:** delegate_task now records Vesta worker boundaries
+**Statement:** `delegate_task` records requested, accepted, running, and final worker states at runtime boundaries, including generated/stable worker id, child session/run ids, model lane, output contract, expected artifact paths, observed artifacts, failures, and explicit unreviewed parent acceptance. Parent Vesta run binding is restored before worker-state writes so child runs cannot steal parent aggregation.
+**Refs:** `tools/delegate_tool.py`, `vesta_runtime/state.py`, `tools/vesta_tools.py`, `tests/vesta/test_worker_state.py`
+**Verification:** `python -m pytest tests/vesta -q` -> 64 passed; `scripts/run_tests.sh tests/vesta` -> 64 passed.
+**Status:** verified

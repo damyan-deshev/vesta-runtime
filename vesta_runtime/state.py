@@ -105,6 +105,60 @@ def _write_if_missing(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _parse_md_field(path: Path, field: str) -> str:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    prefix = f"{field}: `"
+    for line in text.splitlines():
+        if line.startswith(prefix) and line.endswith("`"):
+            return line[len(prefix):-1]
+    return ""
+
+
+def _run_status_from_dir(run_dir: Path) -> str:
+    finalization = run_dir / "finalization.md"
+    if not finalization.exists():
+        return "not_written"
+    return _parse_md_field(finalization, "Verdict") or "not_written"
+
+
+def _infer_run_lineage(
+    *,
+    workspace_hash: str,
+    current_run_id: str,
+    parent_session_id: str | None,
+) -> dict[str, str]:
+    """Infer lightweight recovery lineage from prior runs in the same workspace."""
+
+    lineage = {
+        "resumes_run_id": "",
+        "recovery_of_run_id": "",
+        "supersedes_run_id": "",
+        "resumed_from_session_id": parent_session_id or "",
+    }
+    runs_root = get_hermes_home() / "vesta" / "workspaces" / workspace_hash / "runs"
+    try:
+        candidates = [
+            path for path in runs_root.iterdir()
+            if path.is_dir() and path.name != current_run_id
+        ]
+    except OSError:
+        return lineage
+    candidates.sort(key=lambda path: (path.stat().st_mtime if path.exists() else 0, path.name))
+    for prior in reversed(candidates):
+        if _run_status_from_dir(prior) not in {"blocked", "failed"}:
+            continue
+        lineage["resumes_run_id"] = prior.name
+        lineage["recovery_of_run_id"] = prior.name
+        lineage["supersedes_run_id"] = prior.name
+        if not lineage["resumed_from_session_id"]:
+            lineage["resumed_from_session_id"] = _parse_md_field(prior / "run.md", "Hermes Session ID")
+        break
+    return lineage
+
+
 def _set_env_for_run(run: VestaRun) -> None:
     os.environ["VESTA_RUN_ID"] = run.run_id
     os.environ["VESTA_RUN_DIR"] = str(run.run_dir)
@@ -172,6 +226,10 @@ def create_run(
     provider: str | None = None,
     platform: str | None = None,
     run_id: str | None = None,
+    resumes_run_id: str | None = None,
+    recovery_of_run_id: str | None = None,
+    supersedes_run_id: str | None = None,
+    resumed_from_session_id: str | None = None,
 ) -> VestaRun:
     """Create and bind a Vesta run with eager Markdown seed files."""
 
@@ -182,6 +240,19 @@ def create_run(
     run_dir = get_hermes_home() / "vesta" / "workspaces" / workspace_hash / "runs" / rid
     raw_dir = run_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+    lineage = _infer_run_lineage(
+        workspace_hash=workspace_hash,
+        current_run_id=rid,
+        parent_session_id=parent_session_id,
+    )
+    if resumes_run_id is not None:
+        lineage["resumes_run_id"] = resumes_run_id
+    if recovery_of_run_id is not None:
+        lineage["recovery_of_run_id"] = recovery_of_run_id
+    if supersedes_run_id is not None:
+        lineage["supersedes_run_id"] = supersedes_run_id
+    if resumed_from_session_id is not None:
+        lineage["resumed_from_session_id"] = resumed_from_session_id
 
     run = VestaRun(
         run_id=rid,
@@ -210,6 +281,7 @@ def create_run(
         model=model,
         provider=provider,
         platform=platform,
+        lineage=lineage,
     ))
     _write_if_missing(run.ledger_path, _render_ledger_seed(run, session_id=session_id))
     _write_if_missing(run.raw_index_path, _render_raw_index_seed(run))
@@ -246,11 +318,13 @@ def _render_run_seed(
     model: str | None,
     provider: str | None,
     platform: str | None,
+    lineage: dict[str, str] | None = None,
 ) -> str:
     parent = parent_session_id or ""
-    lineage = f"- {session_id}"
+    session_lineage = f"- {session_id}"
     if parent:
-        lineage = f"- {parent}\n- {session_id}"
+        session_lineage = f"- {parent}\n- {session_id}"
+    run_link = lineage or {}
     return f"""# Vesta Run
 
 Run ID: `{run.run_id}`
@@ -266,7 +340,14 @@ Platform: `{platform or ''}`
 
 ## Hermes Session Lineage
 
-{lineage}
+{session_lineage}
+
+## Run Recovery Lineage
+
+- Resumes Run ID: `{run_link.get('resumes_run_id', '')}`
+- Recovery Of Run ID: `{run_link.get('recovery_of_run_id', '')}`
+- Supersedes Run ID: `{run_link.get('supersedes_run_id', '')}`
+- Resumed From Session ID: `{run_link.get('resumed_from_session_id', '')}`
 
 ## Prompt / Cache Contract
 
@@ -377,6 +458,7 @@ def _render_vesta_effective_config_section() -> str:
     retrieval = cfg.get("retrieval", {})
     whole_document = cfg.get("whole_document", {})
     raw_retention = cfg.get("raw_retention", {})
+    eval_cfg = cfg.get("eval", {})
     return f"""## Vesta Effective Config
 
 - Retrieval Mode: `{retrieval.get('mode', 'disciplined')}`
@@ -387,6 +469,9 @@ def _render_vesta_effective_config_section() -> str:
 - Whole Document Max Chunk Tokens: `{whole_document.get('max_chunk_tokens', 20_000)}`
 - Raw Retention Retain By Default: `{raw_retention.get('retain_by_default', True)}`
 - Raw Retention Purge Preserves Manifest: `{raw_retention.get('purge_preserves_manifest', True)}`
+- Eval Enabled: `{eval_cfg.get('enabled', False)}`
+- Eval Allow Background Review: `{eval_cfg.get('allow_background_review', False)}`
+- Eval Contract Profile: `{eval_cfg.get('contract_profile', 'artifact_positive')}`
 
 ## Prompt Cache Contract
 
@@ -428,6 +513,36 @@ Created At: `{run.created_at}`
 
 ## Entries
 """
+
+
+def _refresh_validator_status_header(run: VestaRun, status: str, timestamp: str) -> None:
+    try:
+        text = run.validator_result_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if "- Validator Status: `" in text:
+        text = re.sub(
+            r"- Validator Status: `[^`]*`",
+            f"- Validator Status: `{status}`",
+            text,
+            count=1,
+        )
+    else:
+        text = text.replace("## Status\n", f"## Status\n\n- Validator Status: `{status}`\n", 1)
+    if "- Last Validator Update: `" in text:
+        text = re.sub(
+            r"- Last Validator Update: `[^`]*`",
+            f"- Last Validator Update: `{timestamp}`",
+            text,
+            count=1,
+        )
+    else:
+        text = text.replace(
+            f"- Validator Status: `{status}`",
+            f"- Validator Status: `{status}`\n- Last Validator Update: `{timestamp}`",
+            1,
+        )
+    run.validator_result_path.write_text(text, encoding="utf-8")
 
 
 def _render_control_plane_seed(run: VestaRun) -> str:
@@ -741,6 +856,59 @@ def _path_is_within_run(path: Path, run: VestaRun) -> bool:
 
 
 ARTIFACT_STATUSES = {"expected", "exists", "missing", "superseded", "purged"}
+_NON_LOCAL_ARTIFACT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _is_local_artifact_path(path: str) -> bool:
+    value = path.strip()
+    return bool(value) and _NON_LOCAL_ARTIFACT_RE.match(value) is None
+
+
+def _resolve_artifact_path(path: str, run: VestaRun) -> Path:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    base = Path(run.workspace_path) if run.workspace_path else Path.cwd()
+    return (base / candidate).resolve(strict=False)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _artifact_verification(path: str, requested_status: str, run: VestaRun) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "requested_status": requested_status,
+        "status": requested_status,
+        "verified": False,
+        "canonical_path": path.strip(),
+        "verification_note": "",
+    }
+    if not _is_local_artifact_path(path):
+        if requested_status == "exists":
+            info["verification_note"] = "Non-local artifact path was not filesystem-verified."
+        return info
+
+    resolved = _resolve_artifact_path(path, run)
+    info["canonical_path"] = str(resolved)
+    if requested_status != "exists":
+        return info
+
+    if not resolved.exists():
+        info["status"] = "missing"
+        info["verification_note"] = "Requested status `exists`, but the filesystem path is missing."
+        return info
+
+    info["verified"] = True
+    info["verified_at"] = _timestamp()
+    info["size_bytes"] = resolved.stat().st_size if resolved.is_file() else None
+    if resolved.is_file():
+        info["content_hash"] = _hash_file(resolved)
+    return info
 
 
 def record_artifact(
@@ -754,27 +922,44 @@ def record_artifact(
 ) -> dict[str, Any]:
     """Append an artifact manifest entry and ledger artifact entry."""
 
-    if status not in ARTIFACT_STATUSES:
-        raise ValueError(f"Unsupported artifact status: {status}")
+    requested_status = status
+    if requested_status not in ARTIFACT_STATUSES:
+        raise ValueError(f"Unsupported artifact status: {requested_status}")
     run = ensure_current_run(session_id=session_id)
     artifact_id = f"art_{uuid.uuid4().hex[:10]}"
     timestamp = _timestamp()
+    verification = _artifact_verification(path, requested_status, run)
+    status = str(verification["status"])
     with _STATE_LOCK:
         with run.artifact_manifest_path.open("a", encoding="utf-8") as f:
             f.write(
                 "\n### "
                 f"{artifact_id}\n\n"
                 f"- Path: `{path}`\n"
+                f"- Canonical Path: `{verification.get('canonical_path', path)}`\n"
                 f"- Type: `{artifact_type}`\n"
                 f"- Expected By: `{expected_by}`\n"
+                f"- Requested Status: `{requested_status}`\n"
                 f"- Status: `{status}`\n"
                 f"- Impact If Missing: {impact_if_missing}\n"
                 f"- Recorded At: `{timestamp}`\n"
             )
+            if verification.get("verified"):
+                f.write(f"- Verified At: `{verification.get('verified_at', '')}`\n")
+                if verification.get("content_hash"):
+                    f.write(f"- Content Hash: `{verification['content_hash']}`\n")
+                if verification.get("size_bytes") is not None:
+                    f.write(f"- Size Bytes: `{verification['size_bytes']}`\n")
+            if verification.get("verification_note"):
+                f.write(f"- Verification Note: {verification['verification_note']}\n")
     append_ledger_entry(
         entry_type="artifact",
         title=f"Artifact {status}: {path}",
-        statement=f"Artifact `{path}` recorded with status `{status}`.",
+        statement=(
+            f"Artifact `{path}` recorded with status `{status}`."
+            if status == requested_status
+            else f"Artifact `{path}` requested as `{requested_status}` but verified as `{status}`."
+        ),
         refs=[path, str(run.artifact_manifest_path)],
         status=status,
         materiality="high" if status in {"expected", "missing"} else "medium",
@@ -785,18 +970,29 @@ def record_artifact(
             "artifact_type": artifact_type,
             "expected_by": expected_by,
             "impact_if_missing": impact_if_missing,
+            "requested_status": requested_status,
+            "canonical_path": verification.get("canonical_path"),
+            "verified": verification.get("verified", False),
+            "content_hash": verification.get("content_hash"),
+            "verification_note": verification.get("verification_note", ""),
         },
     )
     return {
         "artifact_id": artifact_id,
         "artifact_manifest_path": str(run.artifact_manifest_path),
         "status": status,
+        "requested_status": requested_status,
+        "canonical_path": verification.get("canonical_path"),
+        "verified": verification.get("verified", False),
+        "content_hash": verification.get("content_hash"),
+        "verification_note": verification.get("verification_note", ""),
     }
 
 
 WORKER_STATUSES = {
     "requested",
     "accepted",
+    "rejected",
     "running",
     "completed",
     "failed",
@@ -848,6 +1044,8 @@ def record_worker_state(
     model_lane: str,
     output_contract: dict[str, Any] | None = None,
     child_session_id: str = "",
+    child_run_id: str = "",
+    expected_artifact_paths: list[str] | None = None,
     artifact_paths: list[str] | None = None,
     failures: list[str] | None = None,
     gaps: list[str] | None = None,
@@ -876,10 +1074,12 @@ def record_worker_state(
         "worker_id": worker_id.strip(),
         "parent_run_id": run.run_id,
         "child_session_id": child_session_id.strip(),
+        "child_run_id": child_run_id.strip(),
         "objective": objective.strip(),
         "output_contract": output_contract or {},
         "model_lane": model_lane.strip(),
         "status": status,
+        "expected_artifact_paths": expected_artifact_paths or [],
         "artifacts": artifact_paths or [],
         "failures": failures or [],
         "gaps": gaps or [],
@@ -898,10 +1098,12 @@ def record_worker_state(
                 f"- Recorded At: `{timestamp}`\n"
                 f"- Parent Run ID: `{run.run_id}`\n"
                 f"- Child Session ID: `{safe_payload['child_session_id']}`\n"
+                f"- Child Run ID: `{safe_payload['child_run_id']}`\n"
                 f"- Objective: {safe_payload['objective']}\n"
                 f"- Status: `{status}`\n"
                 f"- Model Lane: `{safe_payload['model_lane']}`\n"
                 f"- Parent Acceptance: `{parent_acceptance}`\n"
+                f"- Expected Artifact Paths: `{_json_compact(safe_payload['expected_artifact_paths'])}`\n"
                 f"- Artifacts: `{_json_compact(safe_payload['artifacts'])}`\n"
                 f"- Failures: `{_json_compact(safe_payload['failures'])}`\n"
                 f"- Gaps: `{_json_compact(safe_payload['gaps'])}`\n"
@@ -917,7 +1119,7 @@ def record_worker_state(
         statement=f"Worker `{worker_id.strip()}` recorded with status `{status}`.",
         refs=[str(run.worker_state_path), *[str(path) for path in (artifact_paths or [])]],
         status=status,
-        materiality="high" if status in {"failed", "truncated", "cancelled"} else "medium",
+        materiality="high" if status in {"failed", "truncated", "cancelled", "rejected"} else "medium",
         next_action=next_action or None,
         session_id=session_id,
         actor="runtime",
@@ -926,12 +1128,17 @@ def record_worker_state(
             "status": status,
             "parent_acceptance": parent_acceptance,
             "model_lane": safe_payload["model_lane"],
+            "child_session_id": safe_payload["child_session_id"],
+            "child_run_id": safe_payload["child_run_id"],
         },
     )
     return {
         "worker_id": safe_payload["worker_id"],
         "status": status,
         "parent_acceptance": parent_acceptance,
+        "child_session_id": safe_payload["child_session_id"],
+        "child_run_id": safe_payload["child_run_id"],
+        "expected_artifact_paths": safe_payload["expected_artifact_paths"],
         "worker_state_path": str(run.worker_state_path),
         "recorded_at": timestamp,
     }
@@ -998,6 +1205,7 @@ def record_validator_result(
                 f"- Skip Reason: {payload['skip_reason']}\n"
                 f"- Structured Payload: `{_json_compact(payload)}`\n"
             )
+        _refresh_validator_status_header(run, status, timestamp)
 
     append_ledger_entry(
         entry_type="verification" if status in {"passed", "skipped"} else "failure",
@@ -1048,6 +1256,31 @@ def _artifact_blocks(run: VestaRun) -> list[dict[str, str]]:
     return blocks
 
 
+def _artifact_key(artifact: dict[str, str], run: VestaRun) -> str:
+    canonical = artifact.get("canonical_path", "").strip()
+    if canonical:
+        return canonical
+    path = artifact.get("path", "").strip()
+    if not path:
+        return artifact.get("id", "")
+    if not _is_local_artifact_path(path):
+        return path
+    return str(_resolve_artifact_path(path, run))
+
+
+def _latest_artifact_blocks(run: VestaRun) -> list[dict[str, str]]:
+    latest: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+    for artifact in _artifact_blocks(run):
+        key = _artifact_key(artifact, run)
+        if not key:
+            key = artifact.get("id", "")
+        if key not in latest:
+            order.append(key)
+        latest[key] = artifact
+    return [latest[key] for key in order if key in latest]
+
+
 def _worker_entries(run: VestaRun) -> list[dict[str, Any]]:
     try:
         text = run.worker_state_path.read_text(encoding="utf-8")
@@ -1085,6 +1318,7 @@ def _expected_worker_artifacts(worker: dict[str, Any]) -> list[str]:
     if isinstance(contract, dict):
         paths.extend(str(path) for path in _as_list(contract.get("expected_artifact")) if path)
         paths.extend(str(path) for path in _as_list(contract.get("expected_artifacts")) if path)
+    paths.extend(str(path) for path in _as_list(worker.get("expected_artifact_paths")) if path)
     paths.extend(str(path) for path in _as_list(worker.get("artifacts")) if path)
     seen: set[str] = set()
     unique: list[str] = []
@@ -1123,7 +1357,7 @@ def _worker_finalization_state(run: VestaRun) -> dict[str, Any]:
         status = str(worker.get("status") or "")
         if status in {"requested", "accepted", "running"}:
             incomplete.append(worker_id)
-        if status in {"failed", "cancelled"}:
+        if status in {"failed", "cancelled", "rejected"}:
             failed.append(worker_id)
         if status == "truncated":
             truncated.append(worker_id)
@@ -1198,6 +1432,29 @@ def _validator_finalization_state(run: VestaRun) -> dict[str, Any]:
     return {"status": status, "entry": entry, "blockers": blockers}
 
 
+def _run_lineage_metadata(run: VestaRun) -> dict[str, str]:
+    return {
+        "hermes_session_id": _parse_md_field(run.run_md_path, "Hermes Session ID"),
+        "hermes_parent_session_id": _parse_md_field(run.run_md_path, "Hermes Parent Session ID"),
+        "resumes_run_id": _parse_md_field(run.run_md_path, "- Resumes Run ID"),
+        "recovery_of_run_id": _parse_md_field(run.run_md_path, "- Recovery Of Run ID"),
+        "supersedes_run_id": _parse_md_field(run.run_md_path, "- Supersedes Run ID"),
+        "resumed_from_session_id": _parse_md_field(run.run_md_path, "- Resumed From Session ID"),
+    }
+
+
+def _render_run_lineage_summary(run: VestaRun) -> str:
+    lineage = _run_lineage_metadata(run)
+    return (
+        f"- Primary Hermes Session ID: `{lineage.get('hermes_session_id', '')}`\n"
+        f"- Parent Hermes Session ID: `{lineage.get('hermes_parent_session_id', '')}`\n"
+        f"- Resumes Run ID: `{lineage.get('resumes_run_id', '')}`\n"
+        f"- Recovery Of Run ID: `{lineage.get('recovery_of_run_id', '')}`\n"
+        f"- Supersedes Run ID: `{lineage.get('supersedes_run_id', '')}`\n"
+        f"- Resumed From Session ID: `{lineage.get('resumed_from_session_id', '')}`"
+    )
+
+
 def write_control_plane_snapshot(
     *,
     session_id: str | None = None,
@@ -1208,6 +1465,8 @@ def write_control_plane_snapshot(
     run = ensure_current_run(session_id=session_id)
     timestamp = _timestamp()
     sid = session_id or os.getenv("HERMES_SESSION_ID") or ""
+    lineage = _run_lineage_metadata(run)
+    primary_sid = lineage.get("hermes_session_id") or sid
     finalization_status = _finalization_status(run)
     validator_state = _validator_finalization_state(run)
     worker_state = _worker_finalization_state(run)
@@ -1223,7 +1482,8 @@ Source Of Truth: Vesta artifact files in `{run.run_dir}`
 
 - Run ID: `{run.run_id}`
 - Run Path: `{run.run_dir}`
-- Active Hermes Session ID: `{sid}`
+- Active Hermes Session ID: `{primary_sid}`
+- Snapshot Requested Session ID: `{sid}`
 - Ledger Path: `{run.ledger_path}`
 - Worker State Path: `{run.worker_state_path}`
 - Finalization Path: `{run.finalization_path}`
@@ -1234,6 +1494,10 @@ Source Of Truth: Vesta artifact files in `{run.run_dir}`
 - Finalization Status: `{finalization_status}`
 - Validator Status: `{validator_state.get('status', 'absent')}`
 - Latest Next Action: {resolved_next_action}
+
+## Run Lineage
+
+{_render_run_lineage_summary(run)}
 
 ## Worker Summary
 
@@ -1275,6 +1539,7 @@ Source Of Truth: Vesta artifact files in `{run.run_dir}`
         "finalization_status": finalization_status,
         "validator_status": validator_state.get("status", "absent"),
         "next_action": resolved_next_action,
+        "lineage": lineage,
     }
 
 
@@ -1500,6 +1765,166 @@ def _render_residual_risk(
     return "\n".join(f"- {risk}" for risk in risks) if risks else "- none recorded"
 
 
+def _entry_matches_types(entry: dict[str, str], entry_types: list[str] | None) -> bool:
+    if not entry_types:
+        return True
+    allowed = {str(item).strip() for item in entry_types if str(item).strip()}
+    return entry.get("type", "") in allowed
+
+
+def _ledger_entry_public(entry: dict[str, str]) -> dict[str, str]:
+    keys = (
+        "title",
+        "type",
+        "status",
+        "materiality",
+        "statement",
+        "refs",
+        "next_action",
+        "actor",
+        "recorded_at",
+    )
+    return {key: entry.get(key, "") for key in keys if entry.get(key, "")}
+
+
+def _section_lines(path: Path, heading: str, *, limit: int = 20) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.strip() == heading:
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section and line.strip():
+            out.append(line.strip())
+    return out[:limit]
+
+
+def _entry_counts(entries: list[dict[str, str]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for entry in entries:
+        value = entry.get(key, "") or "unknown"
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def ledger_status(*, session_id: str | None = None, limit: int = 8) -> dict[str, Any]:
+    """Return bounded, model-facing ledger state without raw file rehydration."""
+
+    run = ensure_current_run(session_id=session_id)
+    entries = _ledger_entry_summaries(run)
+    recent = [_ledger_entry_public(entry) for entry in entries[-max(1, min(limit, 50)):]]
+    return {
+        "run_id": run.run_id,
+        "ledger_path": str(run.ledger_path),
+        "objective": _section_lines(run.ledger_path, "## Objective", limit=8),
+        "next_action": _latest_ledger_next_action(run),
+        "entry_count": len(entries),
+        "counts_by_type": _entry_counts(entries, "type"),
+        "counts_by_status": _entry_counts(entries, "status"),
+        "recent_entries": recent,
+        "gaps": [
+            _ledger_entry_public(entry)
+            for entry in entries
+            if entry.get("type") in {"gap", "contradiction", "failure"}
+        ][-10:],
+    }
+
+
+def ledger_tail(
+    *,
+    session_id: str | None = None,
+    limit: int = 10,
+    entry_types: list[str] | None = None,
+) -> dict[str, Any]:
+    run = ensure_current_run(session_id=session_id)
+    entries = [
+        _ledger_entry_public(entry)
+        for entry in _ledger_entry_summaries(run)
+        if _entry_matches_types(entry, entry_types)
+    ]
+    bounded = max(1, min(limit, 50))
+    return {
+        "run_id": run.run_id,
+        "ledger_path": str(run.ledger_path),
+        "entries": entries[-bounded:],
+        "returned": min(len(entries), bounded),
+        "total_matching": len(entries),
+    }
+
+
+def ledger_search(
+    *,
+    query: str,
+    session_id: str | None = None,
+    limit: int = 10,
+    entry_types: list[str] | None = None,
+) -> dict[str, Any]:
+    run = ensure_current_run(session_id=session_id)
+    needle = query.strip().lower()
+    matches: list[dict[str, str]] = []
+    if needle:
+        for entry in _ledger_entry_summaries(run):
+            if not _entry_matches_types(entry, entry_types):
+                continue
+            haystack = "\n".join(str(value) for value in entry.values()).lower()
+            if needle in haystack:
+                matches.append(_ledger_entry_public(entry))
+    bounded = max(1, min(limit, 50))
+    return {
+        "run_id": run.run_id,
+        "ledger_path": str(run.ledger_path),
+        "query": query,
+        "matches": matches[:bounded],
+        "returned": min(len(matches), bounded),
+        "total_matching": len(matches),
+    }
+
+
+def artifact_manifest_status(*, session_id: str | None = None) -> dict[str, Any]:
+    run = ensure_current_run(session_id=session_id)
+    latest = _latest_artifact_blocks(run)
+    return {
+        "run_id": run.run_id,
+        "artifact_manifest_path": str(run.artifact_manifest_path),
+        "artifacts": latest,
+        "counts_by_status": _entry_counts(latest, "status"),
+        "open_artifacts": [
+            artifact for artifact in latest
+            if artifact.get("status") in {"expected", "missing"}
+        ],
+    }
+
+
+def run_status(*, session_id: str | None = None) -> dict[str, Any]:
+    run = ensure_current_run(session_id=session_id)
+    validator_state = _validator_finalization_state(run)
+    worker_state = _worker_finalization_state(run)
+    artifacts = artifact_manifest_status(session_id=session_id)
+    return {
+        "run_id": run.run_id,
+        "run_dir": str(run.run_dir),
+        "workspace_path": run.workspace_path,
+        "ledger_path": str(run.ledger_path),
+        "artifact_manifest_path": str(run.artifact_manifest_path),
+        "finalization_path": str(run.finalization_path),
+        "control_plane_path": str(run.control_plane_path),
+        "handoff_path": str(run.handoff_path),
+        "finalization_status": _finalization_status(run),
+        "next_action": _latest_ledger_next_action(run),
+        "lineage": _run_lineage_metadata(run),
+        "artifacts": artifacts,
+        "worker_state": worker_state,
+        "validator_status": validator_state.get("status", "absent"),
+        "validator_blockers": validator_state.get("blockers", []),
+    }
+
+
 def write_finalization(
     *,
     objective: str,
@@ -1515,7 +1940,7 @@ def write_finalization(
     """Write finalization packet from recorded run state."""
 
     run = ensure_current_run(session_id=session_id)
-    artifacts = _artifact_blocks(run)
+    artifacts = _latest_artifact_blocks(run)
     worker_state = _worker_finalization_state(run)
     validator_state = _validator_finalization_state(run)
     missing_artifacts = [
@@ -1550,6 +1975,10 @@ def write_finalization(
 Run ID: `{run.run_id}`
 Generated At: `{timestamp}`
 Verdict: `{verdict}`
+
+## Run Lineage
+
+{_render_run_lineage_summary(run)}
 
 ## Objective
 
@@ -1618,9 +2047,19 @@ Contradictions:
         actor="runtime",
         structured_payload={"verdict": verdict, "blockers": blockers},
     )
+    control_plane_path = ""
+    try:
+        control = write_control_plane_snapshot(
+            session_id=session_id,
+            next_action=resolved_next or None,
+        )
+        control_plane_path = control.get("control_plane_path", "")
+    except Exception:
+        control_plane_path = ""
     return {
         "run_id": run.run_id,
         "finalization_path": str(run.finalization_path),
+        "control_plane_path": control_plane_path,
         "verdict": verdict,
         "blockers": blockers,
         "next_action": resolved_next,
@@ -1661,13 +2100,97 @@ def _render_worker_summary(worker_state: dict[str, Any]) -> str:
         lines.append(
             f"- `{worker.get('worker_id', '')}` status `{worker.get('status', '')}`, "
             f"parent acceptance `{worker.get('parent_acceptance', '')}`, "
-            f"model lane `{worker.get('model_lane', '')}`"
+            f"model lane `{worker.get('model_lane', '')}`, "
+            f"child session `{worker.get('child_session_id', '')}`, "
+            f"child run `{worker.get('child_run_id', '')}`, "
+            f"expected artifacts `{_json_compact(_expected_worker_artifacts(worker))}`"
         )
     if worker_state.get("blockers"):
         lines.append("")
         lines.append("Blockers:")
         lines.extend(f"- {blocker}" for blocker in worker_state["blockers"])
     return "\n".join(lines)
+
+
+def guard_run_end(
+    *,
+    objective: str = "",
+    exit_reason: str = "",
+    final_response: str | None = None,
+    last_message_role: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Write blocked run state when Hermes exits before Vesta is finalized."""
+
+    run = get_current_run() or _run_from_env()
+    if run is None:
+        return {"guarded": False, "reason": "no_active_run"}
+    if _finalization_status(run) != "not_written":
+        return {"guarded": False, "reason": "finalization_already_written"}
+
+    artifacts = _latest_artifact_blocks(run)
+    open_artifacts = [
+        artifact for artifact in artifacts
+        if artifact.get("status") in {"expected", "missing"}
+    ]
+    ended_on_tool = last_message_role == "tool"
+    missing_response = not (final_response or "").strip()
+    if not open_artifacts and not ended_on_tool and not missing_response:
+        return {"guarded": False, "reason": "no_incomplete_run_state"}
+
+    resolved_objective = (objective or "").strip() or "Complete the active Vesta run."
+    next_action = "Continue from the last durable Vesta state and resolve run-end blockers."
+    if open_artifacts:
+        next_action = "Produce or verify missing artifacts, then finalize the run."
+    elif ended_on_tool:
+        next_action = "Continue from the last tool result and produce the final response."
+
+    failures: list[str] = []
+    if ended_on_tool:
+        failures.append("Run ended after a tool result before a final assistant response.")
+    if missing_response:
+        failures.append("Run ended without a final assistant response.")
+
+    gaps = [
+        f"Run-end guard fired because exit_reason=`{exit_reason or 'unknown'}`."
+    ]
+    if open_artifacts:
+        gaps.append(
+            "Open artifacts remain: "
+            + ", ".join(
+                f"{artifact.get('path', '')} ({artifact.get('status', '')})"
+                for artifact in open_artifacts
+            )
+        )
+
+    finalization = write_finalization(
+        objective=resolved_objective,
+        skip_reason="Run-end guard wrote this packet because normal finalization did not complete.",
+        failures=failures,
+        gaps=gaps,
+        next_action=next_action,
+        session_id=session_id,
+    )
+    control = write_control_plane_snapshot(
+        session_id=session_id,
+        next_action=next_action,
+    )
+    handoff = write_handoff(
+        objective=resolved_objective,
+        completed_work=[],
+        next_action=next_action,
+        session_id=session_id,
+    )
+    return {
+        "guarded": True,
+        "reason": "run_end_incomplete",
+        "verdict": finalization["verdict"],
+        "blockers": finalization["blockers"],
+        "finalization_path": finalization["finalization_path"],
+        "control_plane_path": control["control_plane_path"],
+        "handoff_path": handoff["handoff_path"],
+        "next_action": next_action,
+    }
 
 
 def _render_validator_summary(validator_state: dict[str, Any]) -> str:

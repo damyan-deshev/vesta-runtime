@@ -28,7 +28,7 @@ def test_disciplined_mode_blocks_unjustified_broad_read(tmp_path):
 def test_disciplined_mode_allows_broad_read_after_locator(tmp_path):
     set_current_run(None)
     reset_locator_history()
-    create_run(session_id="session_retrieval", workspace_path=tmp_path, run_id="run_retrieval_locator")
+    run = create_run(session_id="session_retrieval", workspace_path=tmp_path, run_id="run_retrieval_locator")
     target = tmp_path / "large.txt"
     _write_lines(target, 300)
 
@@ -39,6 +39,40 @@ def test_disciplined_mode_allows_broad_read_after_locator(tmp_path):
 
     assert "error" not in result
     assert result["_vesta_retrieval"]["broad"] is True
+    assert result["_vesta_retrieval"]["locator_present"] is True
+    ledger = run.ledger_path.read_text(encoding="utf-8")
+    assert "Broad read allowed" in ledger
+    assert "relevant locator-first evidence present" in ledger
+
+
+def test_disciplined_mode_blocks_broad_read_after_zero_result_locator(tmp_path):
+    set_current_run(None)
+    reset_locator_history()
+    create_run(session_id="session_retrieval", workspace_path=tmp_path, run_id="run_retrieval_zero_locator")
+    target = tmp_path / "large.txt"
+    _write_lines(target, 300)
+
+    search_result = json.loads(search_tool("no such text", path=str(tmp_path), task_id="task_zero_locator"))
+    assert search_result["total_count"] == 0
+    result = json.loads(read_file_tool(str(target), offset=1, limit=500, task_id="task_zero_locator"))
+
+    assert "Vesta retrieval policy blocked" in result["error"]
+
+
+def test_disciplined_mode_blocks_broad_read_after_unrelated_locator(tmp_path):
+    set_current_run(None)
+    reset_locator_history()
+    create_run(session_id="session_retrieval", workspace_path=tmp_path, run_id="run_retrieval_unrelated_locator")
+    target = tmp_path / "large.txt"
+    unrelated = tmp_path / "unrelated.txt"
+    _write_lines(target, 300)
+    unrelated.write_text("needle\n", encoding="utf-8")
+
+    search_result = json.loads(search_tool("needle", path=str(tmp_path), task_id="task_unrelated_locator"))
+    assert search_result["total_count"] == 1
+    result = json.loads(read_file_tool(str(target), offset=1, limit=500, task_id="task_unrelated_locator"))
+
+    assert "Vesta retrieval policy blocked" in result["error"]
 
 
 def test_disciplined_mode_allows_declared_complete_coverage(tmp_path):

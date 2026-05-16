@@ -7,15 +7,21 @@ history; Vesta keeps durable run state that models and humans can inspect.
 from .state import (
     VestaRun,
     append_ledger_entry,
+    artifact_manifest_status,
     capture_raw_output,
     create_run,
     get_current_run,
+    guard_run_end,
+    ledger_search,
+    ledger_status,
+    ledger_tail,
     purge_raw_ref,
     record_session_rotation,
     record_artifact,
     record_worker_state,
     record_validator_result,
     set_current_run,
+    run_status,
     write_control_plane_snapshot,
     write_resume_packet,
     write_handoff,
@@ -23,19 +29,31 @@ from .state import (
 )
 from .whole_document import process_document
 from .coding_eval import capture_coding_eval_result, start_coding_eval
+from .eval_contract import (
+    background_review_allowed_for_eval,
+    enforce_eval_contract,
+    eval_mode_enabled,
+    seed_eval_contract_from_prompt,
+)
 
 __all__ = [
     "VestaRun",
     "append_ledger_entry",
+    "artifact_manifest_status",
     "capture_raw_output",
     "create_run",
     "get_current_run",
+    "guard_run_end",
+    "ledger_search",
+    "ledger_status",
+    "ledger_tail",
     "purge_raw_ref",
     "record_session_rotation",
     "record_artifact",
     "record_worker_state",
     "record_validator_result",
     "set_current_run",
+    "run_status",
     "write_control_plane_snapshot",
     "write_resume_packet",
     "write_handoff",
@@ -43,4 +61,8 @@ __all__ = [
     "process_document",
     "start_coding_eval",
     "capture_coding_eval_result",
+    "background_review_allowed_for_eval",
+    "enforce_eval_contract",
+    "eval_mode_enabled",
+    "seed_eval_contract_from_prompt",
 ]

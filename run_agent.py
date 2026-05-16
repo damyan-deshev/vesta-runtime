@@ -2970,6 +2970,99 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
 
+    def _forced_compression_reason(self, *, api_call_count: int, phase: str) -> str:
+        """Return a deterministic debug/test compression trigger reason."""
+
+        for key in ("VESTA_FORCE_COMPRESSION_NEXT", "HERMES_FORCE_COMPRESSION_NEXT"):
+            if env_var_enabled(key):
+                os.environ[key] = "0"
+                return f"{key}=1 at {phase}"
+        for key in ("VESTA_FORCE_COMPRESSION_AFTER_TURNS", "HERMES_FORCE_COMPRESSION_AFTER_TURNS"):
+            raw = os.getenv(key)
+            if not raw:
+                continue
+            try:
+                threshold = int(raw)
+            except ValueError:
+                continue
+            if threshold <= 0 or api_call_count < threshold:
+                continue
+            fired_key = f"_{key.lower()}_fired"
+            if getattr(self, fired_key, False):
+                continue
+            setattr(self, fired_key, True)
+            return f"{key}={threshold} reached at api_call_count={api_call_count}"
+        return ""
+
+    def _compression_check_decision(
+        self,
+        *,
+        current_tokens: int,
+        phase: str,
+        api_call_count: int = 0,
+    ) -> dict:
+        """Log and return the compression decision inputs for a check point."""
+
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is None:
+            decision = {
+                "enabled": False,
+                "trigger": False,
+                "reason": "no_context_compressor",
+                "phase": phase,
+                "current_tokens": current_tokens,
+            }
+            logger.info("Compression check: %s", decision)
+            return decision
+
+        force_reason = self._forced_compression_reason(
+            api_call_count=api_call_count,
+            phase=phase,
+        )
+        enabled = bool(getattr(self, "compression_enabled", False))
+        if enabled:
+            threshold_trigger = bool(compressor.should_compress(current_tokens))
+        else:
+            threshold_trigger = False
+        trigger = bool(force_reason or (enabled and threshold_trigger))
+        if force_reason:
+            reason = force_reason
+        elif not enabled:
+            reason = "compression_disabled"
+        elif threshold_trigger:
+            reason = "current_tokens_at_or_above_threshold"
+        else:
+            reason = "current_tokens_below_threshold"
+
+        decision = {
+            "enabled": enabled,
+            "trigger": trigger,
+            "reason": reason,
+            "phase": phase,
+            "api_call_count": api_call_count,
+            "configured_context_length": getattr(compressor, "context_length", 0),
+            "compressor_context_length": getattr(compressor, "context_length", 0),
+            "threshold_percent": getattr(compressor, "threshold_percent", 0),
+            "threshold_tokens": getattr(compressor, "threshold_tokens", 0),
+            "current_tokens": current_tokens,
+            "compression_count": getattr(compressor, "compression_count", 0),
+        }
+        logger.info(
+            "Compression check: phase=%s enabled=%s configured_context_length=%s "
+            "compressor_context_length=%s threshold_percent=%s threshold_tokens=%s "
+            "current_tokens=%s trigger=%s reason=%s",
+            decision["phase"],
+            decision["enabled"],
+            decision["configured_context_length"],
+            decision["compressor_context_length"],
+            decision["threshold_percent"],
+            decision["threshold_tokens"],
+            decision["current_tokens"],
+            decision["trigger"],
+            decision["reason"],
+        )
+        return decision
+
     # Headers we capture from the dying stream's HTTP response so post-mortem
     # diagnosis can answer "which CF edge / which OpenRouter downstream
     # provider / which request id".  Lowercased; httpx returns CIMultiDict.
@@ -4239,6 +4332,21 @@ class AIAgent:
         "genuinely nothing stands out on either, say 'Nothing to save.' "
         "and stop — but don't reach for that conclusion as a default."
     )
+
+    def _background_review_allowed(self) -> bool:
+        """Return whether automatic background memory/skill review may run."""
+
+        if self.quiet_mode:
+            return False
+        try:
+            from vesta_runtime import background_review_allowed_for_eval
+
+            if not background_review_allowed_for_eval():
+                return False
+        except Exception:
+            if str(os.getenv("HERMES_SESSION_SOURCE") or "").strip().lower() == "eval":
+                return False
+        return True
 
     @staticmethod
     def _summarize_background_review_actions(
@@ -12324,6 +12432,15 @@ class AIAgent:
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
+        try:
+            from vesta_runtime import seed_eval_contract_from_prompt as _vesta_seed_eval_contract
+
+            _vesta_seed_eval_contract(
+                prompt=original_user_message,
+                session_id=self.session_id or "",
+            )
+        except Exception as _vesta_err:
+            logger.debug("Vesta eval contract seed failed: %s", _vesta_err)
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -12419,7 +12536,12 @@ class AIAgent:
                 tools=self.tools or None,
             )
 
-            if _preflight_tokens >= self.context_compressor.threshold_tokens:
+            _compression_decision = self._compression_check_decision(
+                current_tokens=_preflight_tokens,
+                phase="preflight",
+                api_call_count=0,
+            )
+            if _compression_decision["trigger"]:
                 logger.info(
                     "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                     f"{_preflight_tokens:,}",
@@ -12464,7 +12586,12 @@ class AIAgent:
                         system_prompt=active_system_prompt or "",
                         tools=self.tools or None,
                     )
-                    if _preflight_tokens < self.context_compressor.threshold_tokens:
+                    _compression_decision = self._compression_check_decision(
+                        current_tokens=_preflight_tokens,
+                        phase="preflight_after_pass",
+                        api_call_count=0,
+                    )
+                    if not _compression_decision["trigger"]:
                         break  # Under threshold
 
         # Plugin hook: pre_llm_call
@@ -15367,7 +15494,12 @@ class AIAgent:
                             messages, tools=self.tools or None
                         )
 
-                    if self.compression_enabled and _compressor.should_compress(_real_tokens):
+                    _compression_decision = self._compression_check_decision(
+                        current_tokens=_real_tokens,
+                        phase="post_tool",
+                        api_call_count=api_call_count,
+                    )
+                    if _compression_decision["trigger"]:
                         self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
@@ -15883,6 +16015,35 @@ class AIAgent:
         else:
             logger.info(_diag_msg, *_diag_args)
 
+        vesta_eval_contract = None
+        if not interrupted:
+            try:
+                from vesta_runtime import enforce_eval_contract as _vesta_enforce_eval_contract
+
+                vesta_eval_contract = _vesta_enforce_eval_contract(
+                    messages=list(messages),
+                    final_response=final_response,
+                    objective=_summarize_user_message_for_log(original_user_message),
+                    session_id=self.session_id or "",
+                )
+            except Exception as _vesta_err:
+                logger.debug("Vesta eval contract enforcement failed: %s", _vesta_err)
+
+        vesta_run_end_guard = None
+        if not interrupted:
+            try:
+                from vesta_runtime import guard_run_end as _vesta_guard_run_end
+
+                vesta_run_end_guard = _vesta_guard_run_end(
+                    objective=_summarize_user_message_for_log(original_user_message),
+                    exit_reason=_turn_exit_reason,
+                    final_response=final_response,
+                    last_message_role=_last_msg_role,
+                    session_id=self.session_id or "",
+                )
+            except Exception as _vesta_err:
+                logger.debug("Vesta run-end guard failed: %s", _vesta_err)
+
         # File-mutation verifier footer.
         # If one or more ``write_file`` / ``patch`` calls failed during this
         # turn and were never superseded by a successful write to the same
@@ -15994,6 +16155,10 @@ class AIAgent:
         }
         if self._tool_guardrail_halt_decision is not None:
             result["guardrail"] = self._tool_guardrail_halt_decision.to_metadata()
+        if vesta_eval_contract:
+            result["vesta_eval_contract"] = vesta_eval_contract
+        if vesta_run_end_guard:
+            result["vesta_run_end_guard"] = vesta_run_end_guard
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
@@ -16029,7 +16194,12 @@ class AIAgent:
 
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
-        if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+        if (
+            self._background_review_allowed()
+            and final_response
+            and not interrupted
+            and (_should_review_memory or _should_review_skills)
+        ):
             try:
                 self._spawn_background_review(
                     messages_snapshot=list(messages),
@@ -16201,7 +16371,8 @@ class AIAgent:
         # path (line ~15449). Only fires when a trigger actually tripped AND
         # we have a real final response.
         if (
-            turn.final_text
+            self._background_review_allowed()
+            and turn.final_text
             and not turn.interrupted
             and (should_review_memory or should_review_skills)
         ):
@@ -16214,7 +16385,35 @@ class AIAgent:
             except Exception:
                 logger.debug("background review spawn raised", exc_info=True)
 
-        return {
+        vesta_eval_contract = None
+        vesta_run_end_guard = None
+        if not turn.interrupted:
+            _last_msg_role = messages[-1].get("role") if messages else None
+            try:
+                from vesta_runtime import enforce_eval_contract as _vesta_enforce_eval_contract
+
+                vesta_eval_contract = _vesta_enforce_eval_contract(
+                    messages=list(messages),
+                    final_response=turn.final_text,
+                    objective=_summarize_user_message_for_log(original_user_message),
+                    session_id=self.session_id or "",
+                )
+            except Exception as _vesta_err:
+                logger.debug("Vesta eval contract enforcement failed: %s", _vesta_err)
+            try:
+                from vesta_runtime import guard_run_end as _vesta_guard_run_end
+
+                vesta_run_end_guard = _vesta_guard_run_end(
+                    objective=_summarize_user_message_for_log(original_user_message),
+                    exit_reason="codex_app_server_turn",
+                    final_response=turn.final_text,
+                    last_message_role=_last_msg_role,
+                    session_id=self.session_id or "",
+                )
+            except Exception as _vesta_err:
+                logger.debug("Vesta run-end guard failed: %s", _vesta_err)
+
+        result = {
             "final_response": turn.final_text,
             "messages": messages,
             "api_calls": 1,  # one app-server "turn" maps to one logical API call
@@ -16224,6 +16423,11 @@ class AIAgent:
             "codex_thread_id": turn.thread_id,
             "codex_turn_id": turn.turn_id,
         }
+        if vesta_eval_contract:
+            result["vesta_eval_contract"] = vesta_eval_contract
+        if vesta_run_end_guard:
+            result["vesta_run_end_guard"] = vesta_run_end_guard
+        return result
 
 
 def main(

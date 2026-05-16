@@ -100,3 +100,5 @@ def test_validator_record_tool_updates_active_run(tmp_path, monkeypatch):
     assert result["status"] == "inconclusive"
     validator_result = run.validator_result_path.read_text(encoding="utf-8")
     assert "Need one more source range." in validator_result
+    assert "Validator Status: `inconclusive`" in validator_result
+    assert "Validator Status: `absent`" not in validator_result

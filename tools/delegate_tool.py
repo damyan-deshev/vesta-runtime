@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
 import os
@@ -214,6 +215,161 @@ def list_active_subagents() -> List[Dict[str, Any]]:
             {k: v for k, v in r.items() if k != "agent"}
             for r in _active_subagents.values()
         ]
+
+
+def _as_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _worker_id_for_task(task: Dict[str, Any], task_index: int, invocation_id: str) -> str:
+    explicit = str(task.get("worker_id") or "").strip()
+    if explicit:
+        return explicit
+    return f"worker_{invocation_id}_{task_index}"
+
+
+def _expected_artifact_paths(
+    output_contract: Dict[str, Any],
+    explicit_paths: Any,
+) -> List[str]:
+    paths: List[str] = []
+    paths.extend(_as_string_list(explicit_paths))
+    for key in (
+        "expected_artifact_path",
+        "expected_artifact_paths",
+        "expected_artifact",
+        "expected_artifacts",
+        "artifact_path",
+        "artifact_paths",
+    ):
+        paths.extend(_as_string_list(output_contract.get(key)))
+    seen: set[str] = set()
+    unique: List[str] = []
+    for path in paths:
+        if path not in seen:
+            unique.append(path)
+            seen.add(path)
+    return unique
+
+
+def _child_session_id(child) -> str:
+    value = getattr(child, "session_id", "")
+    return value if isinstance(value, str) else ""
+
+
+def _child_run_id(child) -> str:
+    run = getattr(child, "vesta_run", None)
+    value = getattr(run, "run_id", "")
+    return value if isinstance(value, str) else ""
+
+
+def _child_model_lane(parent_agent=None, child=None) -> str:
+    provider = ""
+    model = ""
+    if child is not None:
+        provider = getattr(child, "provider", "") or ""
+        model = getattr(child, "model", "") or ""
+    if not provider and parent_agent is not None:
+        provider = getattr(parent_agent, "provider", "") or ""
+    if not model and parent_agent is not None:
+        model = getattr(parent_agent, "model", "") or ""
+    provider = str(provider).strip() or "inherited"
+    model = str(model).strip() or "inherited"
+    return f"{provider}:{model}"
+
+
+def _artifact_exists_for_parent(path: str, parent_agent=None) -> bool:
+    from pathlib import Path
+
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate.exists()
+
+    parent_run = getattr(parent_agent, "vesta_run", None) if parent_agent is not None else None
+    workspace_path = (
+        getattr(parent_run, "workspace_path", None)
+        or os.getenv("TERMINAL_CWD")
+        or os.getcwd()
+    )
+    run_dir = getattr(parent_run, "run_dir", None)
+    if (Path(workspace_path) / candidate).exists():
+        return True
+    return bool(run_dir and (Path(run_dir) / candidate).exists())
+
+
+def _bind_parent_vesta_run(parent_agent=None) -> None:
+    """Restore parent run binding before parent-side worker aggregation writes.
+
+    Child agents can create their own Vesta run and update the process-global
+    current run. Worker aggregation belongs to the parent run, so reset the
+    binding when the parent object exposes it.
+    """
+    parent_run = getattr(parent_agent, "vesta_run", None) if parent_agent is not None else None
+    if parent_run is None:
+        return
+    try:
+        from vesta_runtime import set_current_run
+
+        set_current_run(parent_run)
+    except Exception:
+        logger.debug("Could not bind parent Vesta run for worker aggregation", exc_info=True)
+
+
+def _record_vesta_worker_boundary(
+    *,
+    task: Dict[str, Any],
+    status: str,
+    parent_agent=None,
+    child=None,
+    failures: Optional[List[str]] = None,
+    gaps: Optional[List[str]] = None,
+    artifact_paths: Optional[List[str]] = None,
+    next_action: str = "",
+) -> None:
+    worker_id = str(task.get("_vesta_worker_id") or "").strip()
+    if not worker_id:
+        return
+    _bind_parent_vesta_run(parent_agent)
+    try:
+        from vesta_runtime import record_worker_state
+
+        record_worker_state(
+            worker_id=worker_id,
+            objective=str(task.get("goal") or ""),
+            status=status,
+            model_lane=_child_model_lane(parent_agent=parent_agent, child=child),
+            output_contract=_as_dict(task.get("_vesta_output_contract")),
+            child_session_id=_child_session_id(child) if child is not None else "",
+            child_run_id=_child_run_id(child) if child is not None else "",
+            expected_artifact_paths=_as_string_list(task.get("_vesta_expected_artifact_paths")),
+            artifact_paths=artifact_paths or [],
+            failures=failures or [],
+            gaps=gaps or [],
+            parent_acceptance="unreviewed",
+            next_action=next_action,
+            session_id=getattr(parent_agent, "session_id", None),
+        )
+    except Exception:
+        logger.debug("Vesta worker boundary recording failed", exc_info=True)
+
+
+def _vesta_final_worker_status(child_status: str) -> str:
+    if child_status == "completed":
+        return "completed"
+    if child_status in {"timeout", "max_iterations"}:
+        return "truncated"
+    if child_status == "interrupted":
+        return "cancelled"
+    return "failed"
 
 
 def _extract_output_tail(
@@ -1919,6 +2075,9 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    worker_id: Optional[str] = None,
+    output_contract: Optional[Dict[str, Any]] = None,
+    expected_artifact_paths: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2012,7 +2171,15 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "worker_id": worker_id,
+                "output_contract": output_contract,
+                "expected_artifact_paths": expected_artifact_paths,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2028,6 +2195,31 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    invocation_id = uuid.uuid4().hex[:8]
+    for i, task in enumerate(task_list):
+        task_contract = _as_dict(
+            task.get("output_contract")
+            if "output_contract" in task
+            else output_contract
+        )
+        explicit_expected_paths = (
+            task.get("expected_artifact_paths")
+            if "expected_artifact_paths" in task
+            else expected_artifact_paths
+        )
+        task["_vesta_worker_id"] = _worker_id_for_task(task, i, invocation_id)
+        task["_vesta_output_contract"] = task_contract
+        task["_vesta_expected_artifact_paths"] = _expected_artifact_paths(
+            task_contract,
+            explicit_expected_paths,
+        )
+        _record_vesta_worker_boundary(
+            task=task,
+            status="requested",
+            parent_agent=parent_agent,
+            next_action="Await delegate_task child acceptance.",
+        )
 
     overall_start = time.monotonic()
     results = []
@@ -2053,31 +2245,48 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command")
-                or acp_command
-                or creds.get("command"),
-                override_acp_args=(
-                    task_acp_args
-                    if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
-                ),
-                role=effective_role,
-            )
+            try:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    toolsets=t.get("toolsets") or toolsets,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_acp_command=t.get("acp_command")
+                    or acp_command
+                    or creds.get("command"),
+                    override_acp_args=(
+                        task_acp_args
+                        if task_acp_args is not None
+                        else (acp_args if acp_args is not None else creds.get("args"))
+                    ),
+                    role=effective_role,
+                )
+            except Exception as exc:
+                _record_vesta_worker_boundary(
+                    task=t,
+                    status="rejected",
+                    parent_agent=parent_agent,
+                    failures=[str(exc)],
+                    next_action="Fix delegation configuration before retrying.",
+                )
+                return tool_error(f"Failed to build subagent for task {i}: {exc}")
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            _record_vesta_worker_boundary(
+                task=t,
+                status="accepted",
+                parent_agent=parent_agent,
+                child=child,
+                next_action="Run delegated child task.",
+            )
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
@@ -2086,6 +2295,13 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
+        _record_vesta_worker_boundary(
+            task=_t,
+            status="running",
+            parent_agent=parent_agent,
+            child=child,
+            next_action="Wait for delegated child result.",
+        )
         result = _run_single_child(0, _t["goal"], child, parent_agent)
         results.append(result)
     else:
@@ -2096,6 +2312,13 @@ def delegate_task(
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
+                _record_vesta_worker_boundary(
+                    task=t,
+                    status="running",
+                    parent_agent=parent_agent,
+                    child=child,
+                    next_action="Wait for delegated child result.",
+                )
                 future = executor.submit(
                     _run_single_child,
                     task_index=i,
@@ -2206,6 +2429,49 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    child_by_index = {i: child for (i, _, child) in children}
+    task_by_index = {i: task for (i, task, _) in children}
+    for entry in results:
+        idx = entry.get("task_index")
+        task = task_by_index.get(idx)
+        child = child_by_index.get(idx)
+        if task is None:
+            continue
+        expected_paths = _as_string_list(task.get("_vesta_expected_artifact_paths"))
+        observed_paths = [
+            path for path in expected_paths
+            if _artifact_exists_for_parent(path, parent_agent=parent_agent)
+        ]
+        missing_paths = [path for path in expected_paths if path not in observed_paths]
+        final_status = _vesta_final_worker_status(str(entry.get("status") or ""))
+        failures: List[str] = []
+        if entry.get("error"):
+            failures.append(str(entry["error"]))
+        if final_status == "completed":
+            failures.extend(f"Expected worker artifact missing: {path}" for path in missing_paths)
+
+        entry["worker_id"] = task.get("_vesta_worker_id")
+        entry["child_session_id"] = _child_session_id(child) if child is not None else ""
+        entry["child_run_id"] = _child_run_id(child) if child is not None else ""
+        entry["model_lane"] = _child_model_lane(parent_agent=parent_agent, child=child)
+        entry["output_contract"] = _as_dict(task.get("_vesta_output_contract"))
+        entry["expected_artifact_paths"] = expected_paths
+        entry["observed_artifact_paths"] = observed_paths
+
+        _record_vesta_worker_boundary(
+            task=task,
+            status=final_status,
+            parent_agent=parent_agent,
+            child=child,
+            failures=failures,
+            artifact_paths=observed_paths,
+            next_action=(
+                "Parent must explicitly accept or reject this worker output."
+                if final_status == "completed"
+                else "Inspect worker failure before retrying or accepting."
+            ),
+        )
 
     # Notify parent's memory provider of delegation outcomes
     if (
@@ -2731,6 +2997,19 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "worker_id": {
+                            "type": "string",
+                            "description": "Optional stable Vesta worker id. Runtime generates one if omitted.",
+                        },
+                        "output_contract": {
+                            "type": "object",
+                            "description": "Optional delegated output contract. Stored as runtime state without prose inference.",
+                        },
+                        "expected_artifact_paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional expected artifact paths for this worker.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -2766,6 +3045,19 @@ DELEGATE_TASK_SCHEMA = {
                     "Leave empty unless acp_command is explicitly provided."
                 ),
             },
+            "worker_id": {
+                "type": "string",
+                "description": "Optional stable Vesta worker id for single-task delegation. Runtime generates one if omitted.",
+            },
+            "output_contract": {
+                "type": "object",
+                "description": "Optional delegated output contract. Stored as runtime state without prose inference.",
+            },
+            "expected_artifact_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional expected artifact paths for single-task delegation.",
+            },
         },
         "required": [],
     },
@@ -2788,6 +3080,9 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        worker_id=args.get("worker_id"),
+        output_contract=args.get("output_contract"),
+        expected_artifact_paths=args.get("expected_artifact_paths"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

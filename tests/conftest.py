@@ -187,6 +187,16 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_BACKGROUND_NOTIFICATIONS",
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
+    "VESTA_EVAL_MODE",
+    "VESTA_EVAL_BACKGROUND_REVIEW",
+    "VESTA_EVAL_CONTRACT_PROFILE",
+    "VESTA_EVAL_READ_ONLY_PATHS",
+    "VESTA_EVAL_FORBIDDEN_WRITE_PATHS",
+    "VESTA_EVAL_FORBIDDEN_TOOL_ARGS",
+    "VESTA_FORCE_COMPRESSION_NEXT",
+    "VESTA_FORCE_COMPRESSION_AFTER_TURNS",
+    "HERMES_FORCE_COMPRESSION_NEXT",
+    "HERMES_FORCE_COMPRESSION_AFTER_TURNS",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.

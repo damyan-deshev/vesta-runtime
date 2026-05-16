@@ -8,13 +8,18 @@ import os
 from tools.registry import registry
 from vesta_runtime import (
     append_ledger_entry,
+    artifact_manifest_status,
     capture_coding_eval_result,
+    ledger_search,
+    ledger_status,
+    ledger_tail,
     process_document,
     purge_raw_ref,
     record_artifact,
     record_validator_result,
     record_worker_state,
     start_coding_eval,
+    run_status,
     write_control_plane_snapshot,
     write_finalization,
     write_handoff,
@@ -89,6 +94,80 @@ LEDGER_APPEND_SCHEMA = {
     },
 }
 
+LEDGER_STATUS_SCHEMA = {
+    "name": "ledger_status",
+    "description": (
+        "Return bounded structured Vesta ledger status for the active run: "
+        "objective, next action, counts, recent entries, and open gaps. "
+        "Use this instead of read_file on ledger.md for runtime-state checks."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Maximum recent ledger entries to return, capped by the tool.",
+            },
+        },
+    },
+}
+
+LEDGER_TAIL_SCHEMA = {
+    "name": "ledger_tail",
+    "description": (
+        "Return the most recent bounded ledger entries for the active Vesta run. "
+        "Use for resume/recovery instead of broad-reading ledger.md."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Maximum entries to return."},
+            "entry_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ledger entry types to include.",
+            },
+        },
+    },
+}
+
+LEDGER_SEARCH_SCHEMA = {
+    "name": "ledger_search",
+    "description": "Search active Vesta ledger entries without returning the raw ledger file.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Case-insensitive text query."},
+            "limit": {"type": "integer", "description": "Maximum matching entries to return."},
+            "entry_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ledger entry types to include.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+ARTIFACT_MANIFEST_STATUS_SCHEMA = {
+    "name": "artifact_manifest_status",
+    "description": (
+        "Return latest artifact state for the active Vesta run without raw "
+        "manifest rehydration. Includes open expected/missing artifacts."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
+RUN_STATUS_SCHEMA = {
+    "name": "run_status",
+    "description": (
+        "Return bounded structured status for the active Vesta run: paths, "
+        "finalization, lineage, artifact state, worker state, validator status, "
+        "blockers, and next action."
+    ),
+    "parameters": {"type": "object", "properties": {}},
+}
+
 WHOLE_DOCUMENT_READ_SCHEMA = {
     "name": "whole_document_read",
     "description": (
@@ -122,7 +201,7 @@ ARTIFACT_RECORD_SCHEMA = {
             "path": {"type": "string", "description": "Artifact path or planned path."},
             "artifact_type": {"type": "string", "description": "Artifact kind, such as report, patch, handoff, eval, or document."},
             "expected_by": {"type": "string", "description": "Why this artifact is expected: user_request, model_commitment, worker_contract, or run_path."},
-            "status": {"type": "string", "enum": ["expected", "exists", "missing", "superseded", "purged"], "description": "Current artifact status."},
+            "status": {"type": "string", "enum": ["expected", "exists", "missing", "superseded", "purged"], "description": "Current artifact status. Local paths recorded as exists are filesystem-verified by Vesta."},
             "impact_if_missing": {"type": "string", "description": "Why missing this artifact matters."},
         },
         "required": ["path", "artifact_type", "expected_by"],
@@ -151,7 +230,7 @@ FINALIZE_RUN_SCHEMA = {
 WORKER_STATE_RECORD_SCHEMA = {
     "name": "worker_state_record",
     "description": (
-        "Record requested, accepted, running, completed, failed, truncated, "
+        "Record requested, accepted, rejected, running, completed, failed, truncated, "
         "or cancelled worker state in the active Vesta run. Use this around "
         "delegated work so parent acceptance and finalization can inspect "
         "worker artifacts, gaps, failures, material claims, and model lane."
@@ -163,7 +242,7 @@ WORKER_STATE_RECORD_SCHEMA = {
             "objective": {"type": "string", "description": "Worker objective or scope."},
             "status": {
                 "type": "string",
-                "enum": ["requested", "accepted", "running", "completed", "failed", "truncated", "cancelled"],
+                "enum": ["requested", "accepted", "rejected", "running", "completed", "failed", "truncated", "cancelled"],
                 "description": "Current worker status.",
             },
             "model_lane": {
@@ -175,6 +254,12 @@ WORKER_STATE_RECORD_SCHEMA = {
                 "description": "Expected output contract, such as expected_artifact or required sections.",
             },
             "child_session_id": {"type": "string", "description": "Child Hermes session id, if known."},
+            "child_run_id": {"type": "string", "description": "Child Vesta run id, if known."},
+            "expected_artifact_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Artifact paths the worker contract expects, separate from observed artifacts.",
+            },
             "artifact_paths": {"type": "array", "items": {"type": "string"}},
             "failures": {"type": "array", "items": {"type": "string"}},
             "gaps": {"type": "array", "items": {"type": "string"}},
@@ -346,6 +431,66 @@ def _handle_ledger_append(args, **kw) -> str:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def _bounded_limit(args, default: int) -> int:
+    try:
+        value = int(args.get("limit", default))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, 50))
+
+
+def _handle_ledger_status(args, **kw) -> str:
+    try:
+        result = ledger_status(
+            limit=_bounded_limit(args, 8),
+            session_id=os.getenv("HERMES_SESSION_ID", ""),
+        )
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def _handle_ledger_tail(args, **kw) -> str:
+    try:
+        result = ledger_tail(
+            limit=_bounded_limit(args, 10),
+            entry_types=args.get("entry_types") or None,
+            session_id=os.getenv("HERMES_SESSION_ID", ""),
+        )
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def _handle_ledger_search(args, **kw) -> str:
+    try:
+        result = ledger_search(
+            query=args.get("query", ""),
+            limit=_bounded_limit(args, 10),
+            entry_types=args.get("entry_types") or None,
+            session_id=os.getenv("HERMES_SESSION_ID", ""),
+        )
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def _handle_artifact_manifest_status(args, **kw) -> str:
+    try:
+        result = artifact_manifest_status(session_id=os.getenv("HERMES_SESSION_ID", ""))
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def _handle_run_status(args, **kw) -> str:
+    try:
+        result = run_status(session_id=os.getenv("HERMES_SESSION_ID", ""))
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def _handle_whole_document_read(args, **kw) -> str:
     try:
         result = process_document(
@@ -400,6 +545,8 @@ def _handle_worker_state_record(args, **kw) -> str:
             model_lane=args.get("model_lane", ""),
             output_contract=args.get("output_contract") or None,
             child_session_id=args.get("child_session_id", ""),
+            child_run_id=args.get("child_run_id", ""),
+            expected_artifact_paths=args.get("expected_artifact_paths") or [],
             artifact_paths=args.get("artifact_paths") or [],
             failures=args.get("failures") or [],
             gaps=args.get("gaps") or [],
@@ -509,6 +656,51 @@ registry.register(
     handler=_handle_ledger_append,
     emoji="📒",
     max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="ledger_status",
+    toolset="vesta",
+    schema=LEDGER_STATUS_SCHEMA,
+    handler=_handle_ledger_status,
+    emoji="📒",
+    max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="ledger_tail",
+    toolset="vesta",
+    schema=LEDGER_TAIL_SCHEMA,
+    handler=_handle_ledger_tail,
+    emoji="📒",
+    max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="ledger_search",
+    toolset="vesta",
+    schema=LEDGER_SEARCH_SCHEMA,
+    handler=_handle_ledger_search,
+    emoji="🔎",
+    max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="artifact_manifest_status",
+    toolset="vesta",
+    schema=ARTIFACT_MANIFEST_STATUS_SCHEMA,
+    handler=_handle_artifact_manifest_status,
+    emoji="📦",
+    max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="run_status",
+    toolset="vesta",
+    schema=RUN_STATUS_SCHEMA,
+    handler=_handle_run_status,
+    emoji="🧭",
+    max_result_size_chars=30_000,
 )
 
 registry.register(

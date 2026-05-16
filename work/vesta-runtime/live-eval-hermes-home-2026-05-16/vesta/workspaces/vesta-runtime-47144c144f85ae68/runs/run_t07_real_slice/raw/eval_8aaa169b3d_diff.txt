@@ -1,8 +1,0 @@
---- original/retrieval.py
-+++ eval/retrieval.py
-@@ -219,3 +219,5 @@
-         )
-     except Exception:
-         pass
-+
-+# T07 copied-workspace marker: original must remain unchanged.

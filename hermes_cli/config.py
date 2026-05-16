@@ -758,6 +758,14 @@ DEFAULT_CONFIG = {
             "retain_by_default": True,
             "purge_preserves_manifest": True,
         },
+        "eval": {
+            "enabled": False,
+            "allow_background_review": False,
+            "contract_profile": "artifact_positive",
+            "read_only_fixture_paths": [],
+            "forbidden_write_paths": [],
+            "forbidden_tool_args": [],
+        },
     },
 
     # Tool loop guardrails nudge models when they repeat failed or

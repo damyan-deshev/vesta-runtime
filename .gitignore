@@ -73,3 +73,13 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# Vesta local live-eval outputs and scratch prompts.
+work/vesta-runtime/live-eval-*/
+work/vesta-runtime/live-eval-artifacts/
+work/vesta-runtime/s[0-9]*-vesta-*.md
+work/vesta-runtime/t[0-9]*-vesta-*.md
+work/vesta-runtime/vesta-eval-*.md
+work/vesta-runtime/vesta-live-*.md
+work/vesta-runtime/vesta-next-live-suite-plan-*.md
+work/vesta-runtime/scratch/

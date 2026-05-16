@@ -51,7 +51,8 @@ _HERMES_CORE_TOOLS = [
     # Session history search
     "session_search",
     # Vesta durable runtime state
-    "ledger_append", "whole_document_read", "artifact_record",
+    "ledger_append", "ledger_status", "ledger_tail", "ledger_search",
+    "artifact_manifest_status", "run_status", "whole_document_read", "artifact_record",
     "worker_state_record", "coding_eval_start", "coding_eval_capture",
     "raw_ref_purge", "validator_result_record", "control_plane_snapshot",
     "handoff_generate", "finalize_run",

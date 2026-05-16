@@ -174,6 +174,15 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _vesta_eval_write_violation(filepath: str) -> str | None:
+    try:
+        from vesta_runtime.eval_policy import write_path_violation
+
+        return write_path_violation(filepath) or None
+    except Exception:
+        return None
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -612,6 +621,10 @@ def read_file_tool(
                 result_dict.setdefault("_vesta_retrieval", {
                     "mode": _vesta_policy.get("mode"),
                     "broad": True,
+                    "locator_present": _vesta_policy.get("locator_present", False),
+                    "locator": _vesta_policy.get("locator"),
+                    "complete_coverage": _vesta_policy.get("complete_coverage", False),
+                    "broad_read_reason": _vesta_policy.get("broad_read_reason", ""),
                     "broad_reasons": _vesta_policy.get("broad_reasons", []),
                 })
         except Exception:
@@ -865,6 +878,9 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    eval_violation = _vesta_eval_write_violation(path)
+    if eval_violation:
+        return tool_error(eval_violation)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -933,6 +949,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        eval_violation = _vesta_eval_write_violation(_p)
+        if eval_violation:
+            return tool_error(eval_violation)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -1073,13 +1092,23 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
             match_count = None
             if isinstance(result_dict, dict):
-                match_count = result_dict.get("count") or result_dict.get("total_count")
+                match_count = result_dict.get("count")
+                if match_count is None:
+                    match_count = result_dict.get("total_count")
+            matched_paths = []
+            if isinstance(result_dict, dict):
+                for match in result_dict.get("matches") or []:
+                    if isinstance(match, dict) and match.get("path"):
+                        matched_paths.append(str(match["path"]))
+                matched_paths.extend(str(path) for path in result_dict.get("files") or [])
+                matched_paths.extend(str(path) for path in (result_dict.get("counts") or {}).keys())
             record_locator(
                 task_id=task_id,
                 pattern=pattern,
                 target=target,
                 path=str(path),
                 result_count=match_count,
+                matched_paths=matched_paths,
             )
         except Exception:
             logger.debug("Vesta locator history update failed", exc_info=True)

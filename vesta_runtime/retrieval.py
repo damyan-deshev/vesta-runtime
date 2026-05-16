@@ -87,14 +87,22 @@ def record_locator(
     target: str,
     path: str,
     result_count: int | None = None,
+    matched_paths: list[str] | None = None,
 ) -> None:
     """Record a search/manifest action as locator history for a task."""
 
+    coerced_count = result_count
+    if coerced_count is not None:
+        try:
+            coerced_count = int(coerced_count)
+        except (TypeError, ValueError):
+            coerced_count = None
     entry = {
         "pattern": pattern,
         "target": target,
         "path": path,
-        "result_count": result_count,
+        "result_count": coerced_count,
+        "matched_paths": list(dict.fromkeys(matched_paths or []))[:50],
     }
     with _LOCATOR_LOCK:
         items = _LOCATOR_HISTORY.setdefault(task_id, [])
@@ -106,6 +114,54 @@ def record_locator(
 def has_locator_history(task_id: str) -> bool:
     with _LOCATOR_LOCK:
         return bool(_LOCATOR_HISTORY.get(task_id))
+
+
+def _locator_has_positive_results(locator: dict[str, Any]) -> bool:
+    count = locator.get("result_count")
+    if isinstance(count, int):
+        return count > 0
+    return bool(locator.get("matched_paths"))
+
+
+def _resolve_locator_match(match_path: str, locator: dict[str, Any]) -> Path:
+    candidate = Path(match_path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    root_raw = str(locator.get("path") or "")
+    root = Path(root_raw).expanduser() if root_raw else Path.cwd()
+    if root.is_absolute():
+        try:
+            base = root if root.is_dir() else root.parent
+        except OSError:
+            base = root.parent
+    else:
+        base = Path.cwd()
+    return (base / candidate).resolve(strict=False)
+
+
+def _locator_matches_read_path(locator: dict[str, Any], resolved_path: str) -> str | None:
+    read_path = Path(resolved_path).expanduser().resolve(strict=False)
+    for match in locator.get("matched_paths") or []:
+        if not match:
+            continue
+        candidate = _resolve_locator_match(str(match), locator)
+        if candidate == read_path:
+            return str(match)
+    return None
+
+
+def relevant_locator_for_path(task_id: str, resolved_path: str) -> dict[str, Any] | None:
+    with _LOCATOR_LOCK:
+        locators = list(_LOCATOR_HISTORY.get(task_id, []))
+    for locator in reversed(locators):
+        if not _locator_has_positive_results(locator):
+            continue
+        matched_path = _locator_matches_read_path(locator, resolved_path)
+        if matched_path is not None:
+            result = dict(locator)
+            result["matched_path"] = matched_path
+            return result
+    return None
 
 
 def _estimate_tokens_from_bytes(byte_count: int) -> int:
@@ -149,7 +205,8 @@ def evaluate_read(
     if not broad_reasons:
         return {"allowed": True, "broad": False, "mode": cfg.mode}
 
-    locator_present = has_locator_history(task_id)
+    locator = relevant_locator_for_path(task_id, resolved_path)
+    locator_present = locator is not None
     reason_present = bool((broad_read_reason or "").strip())
     if cfg.mode == "disciplined" and not locator_present and not complete_coverage and not reason_present:
         return {
@@ -169,23 +226,45 @@ def evaluate_read(
         }
 
     if cfg.mode == "permissive":
-        _record_broad_read(
-            path=path,
-            offset=offset,
-            limit=limit,
-            mode=cfg.mode,
-            broad_reasons=broad_reasons,
-            broad_read_reason=broad_read_reason or "permissive broad read",
-        )
+        allow_reason = broad_read_reason or "permissive broad read"
+    elif complete_coverage:
+        allow_reason = broad_read_reason or "complete coverage requested"
+    elif reason_present:
+        allow_reason = broad_read_reason or "explicit broad read reason"
+    else:
+        allow_reason = "relevant locator-first evidence present"
+
+    _record_broad_read(
+        path=path,
+        offset=offset,
+        limit=limit,
+        mode=cfg.mode,
+        broad_reasons=broad_reasons,
+        broad_read_reason=allow_reason,
+        locator=locator,
+    )
 
     return {
         "allowed": True,
         "broad": True,
         "mode": cfg.mode,
         "locator_present": locator_present,
+        "locator": _public_locator(locator),
         "complete_coverage": complete_coverage,
         "broad_read_reason": broad_read_reason or "",
         "broad_reasons": broad_reasons,
+    }
+
+
+def _public_locator(locator: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not locator:
+        return None
+    return {
+        "pattern": locator.get("pattern", ""),
+        "target": locator.get("target", ""),
+        "path": locator.get("path", ""),
+        "result_count": locator.get("result_count"),
+        "matched_path": locator.get("matched_path", ""),
     }
 
 
@@ -197,6 +276,7 @@ def _record_broad_read(
     mode: str,
     broad_reasons: list[str],
     broad_read_reason: str,
+    locator: dict[str, Any] | None = None,
 ) -> None:
     try:
         from vesta_runtime import append_ledger_entry
@@ -208,12 +288,13 @@ def _record_broad_read(
                 f"Broad read allowed in {mode} mode for {path} "
                 f"offset={offset} limit={limit}. Reason: {broad_read_reason}"
             ),
-            refs=[path],
+            refs=[path, *(([str(locator.get("matched_path", ""))] if locator else []))],
             status="active",
             materiality="medium",
             structured_payload={
                 "broad_reasons": broad_reasons,
                 "mode": mode,
+                "locator": _public_locator(locator),
             },
             actor="runtime",
         )

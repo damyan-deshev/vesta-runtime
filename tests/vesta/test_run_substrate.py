@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from run_agent import AIAgent
-from vesta_runtime import create_run, get_current_run, record_session_rotation, set_current_run
+from vesta_runtime import create_run, get_current_run, record_artifact, record_session_rotation, set_current_run, write_finalization
 
 
 def test_create_run_seeds_markdown_files_under_hermes_home(monkeypatch, tmp_path):
@@ -83,3 +83,36 @@ def test_record_session_rotation_updates_run_and_ledger(tmp_path):
     assert "New Session ID: `session_new`" in run_md
     assert "Hermes session rotated" in ledger
     assert "compression" in ledger
+
+
+def test_new_run_records_recovery_lineage_from_prior_blocked_run(tmp_path):
+    set_current_run(None)
+    blocked = create_run(
+        session_id="session_blocked",
+        workspace_path=tmp_path,
+        run_id="run_blocked",
+    )
+    record_artifact(
+        path="missing.md",
+        artifact_type="report",
+        expected_by="user_request",
+        status="expected",
+        session_id="session_blocked",
+    )
+    write_finalization(
+        objective="Produce missing report.",
+        verification="Checked manifest.",
+        session_id="session_blocked",
+    )
+
+    recovery = create_run(
+        session_id="session_recovery",
+        workspace_path=tmp_path,
+        run_id="run_recovery",
+    )
+
+    run_md = recovery.run_md_path.read_text(encoding="utf-8")
+    assert "Recovery Of Run ID: `run_blocked`" in run_md
+    assert "Supersedes Run ID: `run_blocked`" in run_md
+    assert "Resumed From Session ID: `session_blocked`" in run_md
+    assert blocked.run_id == "run_blocked"
