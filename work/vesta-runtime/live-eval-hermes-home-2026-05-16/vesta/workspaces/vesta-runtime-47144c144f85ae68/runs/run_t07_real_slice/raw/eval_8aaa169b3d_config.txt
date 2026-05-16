@@ -1,0 +1,1 @@
+{"config": {"api_key": "<redacted>", "base_url": "http://192.168.1.117:1234/v1"}, "excluded_paths": [".git", ".hg", ".svn", ".env", ".env.local", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache", "__pycache__", ".worktrees", ".hermes", "dist", "build"], "include_sensitive_paths": false, "model": "Qwen3.6-27B-MTP-Q6_K", "provider": "custom:vesta-local-llama"}

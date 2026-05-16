@@ -1,0 +1,1 @@
+T07 copied-workspace eval on a real Vesta source slice. Add one harmless marker comment in the copy and verify py_compile.
