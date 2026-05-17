@@ -181,6 +181,10 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("External evidence discipline", prompt)
         self.assertIn("concrete online signal", prompt)
         self.assertIn("speculation", prompt)
+        self.assertIn("shortest evidence path", prompt)
+        self.assertIn("bounded-read", prompt)
+        self.assertIn("same tool, URL, query, or source fails twice", prompt)
+        self.assertIn("Do not spend the full iteration or time budget", prompt)
 
     def test_web_toolsets_trigger_external_evidence_contract_detection(self):
         self.assertTrue(_toolsets_include_external_evidence_tools(["web"]))
