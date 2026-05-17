@@ -76,6 +76,14 @@ _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 
+def _compute_threshold_tokens(context_length: int, threshold_percent: float) -> int:
+    """Compute compression threshold with room for the next tool/reply turn."""
+    percent_threshold = int(context_length * threshold_percent)
+    floor_threshold = max(percent_threshold, MINIMUM_CONTEXT_LENGTH)
+    headroom_cap = max(1, int(context_length * 0.80))
+    return min(floor_threshold, headroom_cap)
+
+
 def _content_length_for_budget(raw_content: Any) -> int:
     """Return the effective char-length of a message's content for token budgeting.
 
@@ -275,7 +283,8 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         return f"[patch] {mode} in {path} ({content_len:,} chars result)"
 
     if tool_name in {"browser_navigate", "browser_click", "browser_snapshot",
-                     "browser_type", "browser_scroll", "browser_vision"}:
+                     "browser_type", "browser_scroll", "browser_vision",
+                     "browser_extract"}:
         url = args.get("url", "")
         ref = args.get("ref", "")
         detail = f" {url}" if url else (f" ref={ref}" if ref else "")
@@ -389,9 +398,9 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
-        self.threshold_tokens = max(
-            int(context_length * self.threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
+        self.threshold_tokens = _compute_threshold_tokens(
+            context_length,
+            self.threshold_percent,
         )
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
@@ -432,13 +441,11 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
-        # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
-        self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
+        # Keep the historical 64K floor for larger windows, but cap it below
+        # the true context limit so small-context models still have headroom.
+        self.threshold_tokens = _compute_threshold_tokens(
+            self.context_length,
+            threshold_percent,
         )
         self.compression_count = 0
 

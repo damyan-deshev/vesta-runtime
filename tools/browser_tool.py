@@ -51,6 +51,7 @@ Usage:
 
 import atexit
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -1382,6 +1383,27 @@ BROWSER_TOOL_SCHEMAS = [
         }
     },
     {
+        "name": "browser_extract",
+        "description": "Extract normalized markdown/text evidence from the currently rendered browser page after browser_navigate and any needed clicks, waits, scrolling, or pagination. This consumes the already-rendered page; it does not fetch a URL itself. Use it for AJAX/React/dynamic pages when web_extract is unavailable or insufficient. Returns normalized markdown, not raw HTML, JavaScript, DOM nodes, browser element refs, or a live page. Do not repeat this tool waiting for DOM-like output; interact with the browser first if the rendered state is incomplete.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector for the rendered page region to normalize, e.g. 'main' or 'article'. Omit to normalize the whole rendered document."
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum normalized content characters to return. Defaults to 12000 and is capped at 50000. During active Vesta disciplined runs this is also capped by vesta.retrieval.broad_read_byte_threshold.",
+                    "minimum": 1000,
+                    "maximum": 50000,
+                    "default": 12000
+                }
+            },
+            "required": []
+        }
+    },
+    {
         "name": "browser_click",
         "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
         "parameters": {
@@ -2356,6 +2378,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         except Exception as e:
             logger.debug("Auto-snapshot after navigate failed: %s", e)
 
+        response = _apply_browser_snapshot_budget(response, "browser_navigate")
         return json.dumps(response, ensure_ascii=False)
     else:
         return json.dumps({
@@ -2424,6 +2447,7 @@ def browser_snapshot(
         except Exception as _sv_exc:
             logger.debug("supervisor snapshot merge failed: %s", _sv_exc)
 
+        response = _apply_browser_snapshot_budget(response, "browser_snapshot")
         return json.dumps(response, ensure_ascii=False)
     else:
         response = {
@@ -2431,6 +2455,578 @@ def browser_snapshot(
             "error": result.get("error", "Failed to get snapshot")
         }
         return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+_BROWSER_EXTRACT_INPUT_MAX_CHARS = 400_000
+_BROWSER_EXTRACT_DEFAULT_MAX_CHARS = 12_000
+_BROWSER_EXTRACT_MAX_CHARS = 50_000
+_BROWSER_EXTRACT_MAX_PER_PAGE = 3
+_BROWSER_EXTRACT_SEEN_LOCK = threading.Lock()
+_BROWSER_EXTRACT_SEEN_BY_TASK: Dict[str, set[str]] = {}
+_BROWSER_EXTRACT_COUNT_BY_TASK: Dict[str, Dict[tuple[str, str], int]] = {}
+
+
+def _browser_text_output_limit_info(source: str) -> Dict[str, Any]:
+    try:
+        from tools.tool_output_limits import (
+            get_tool_output_limits,
+            get_vesta_retrieval_output_limit_info,
+        )
+
+        configured = int(get_tool_output_limits()["max_bytes"])
+        return get_vesta_retrieval_output_limit_info(configured, source=source)
+    except Exception:
+        return {
+            "max_bytes": 50_000,
+            "source": source,
+            "vesta_active": False,
+            "disciplined": False,
+        }
+
+
+def _truncate_browser_text(text: Any, max_chars: int) -> Tuple[str, int]:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value, 0
+    if max_chars <= 0:
+        return "", len(value)
+    cutoff = value.rfind("\n", 0, max_chars)
+    if cutoff < int(max_chars * 0.75):
+        cutoff = max_chars
+    truncated = value[:cutoff].rstrip()
+    return truncated, len(value) - len(truncated)
+
+
+def _apply_browser_console_budget(
+    response: Dict[str, Any],
+    limit_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not (limit_info.get("vesta_active") and limit_info.get("disciplined")):
+        return response
+
+    max_chars = int(limit_info.get("max_bytes") or 0)
+    remaining = max_chars
+    original_chars = 0
+    omitted_chars = 0
+    truncated_items = 0
+
+    for collection_name, text_key in (
+        ("console_messages", "text"),
+        ("js_errors", "message"),
+    ):
+        records = response.get(collection_name)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            raw_text = str(record.get(text_key) or "")
+            original_chars += len(raw_text)
+            truncated, omitted = _truncate_browser_text(raw_text, remaining)
+            record[text_key] = truncated
+            if omitted > 0:
+                record["truncated"] = True
+                record["omitted_chars"] = omitted
+                truncated_items += 1
+            omitted_chars += omitted
+            remaining = max(0, remaining - len(truncated))
+
+    if omitted_chars > 0:
+        response.update({
+            "truncated": True,
+            "original_chars": original_chars,
+            "max_chars": max_chars,
+            "omitted_chars": omitted_chars,
+            "truncated_items": truncated_items,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            "repair_hint": (
+                "browser_console returned bounded text for this Vesta run. "
+                "Use targeted JavaScript expressions, clear the console, inspect "
+                "specific errors, or checkpoint the relevant evidence instead of "
+                "requesting another broad console dump."
+            ),
+        })
+    return response
+
+
+def _apply_browser_snapshot_budget(response: Dict[str, Any], source: str) -> Dict[str, Any]:
+    limit_info = _browser_text_output_limit_info(source)
+    if not (limit_info.get("vesta_active") and limit_info.get("disciplined")):
+        return response
+
+    snapshot = str(response.get("snapshot") or "")
+    if not snapshot:
+        return response
+
+    max_chars = int(limit_info.get("max_bytes") or 0)
+    original_chars = len(snapshot)
+    try:
+        from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+        checkpoint_notice = (
+            vesta_evidence_checkpoint_notice(source)
+            if original_chars > min(max_chars, 1_000)
+            else None
+        )
+    except Exception:
+        checkpoint_notice = None
+    if checkpoint_notice:
+        response["snapshot"] = ""
+        response.update({
+            "truncated": True,
+            "original_chars": original_chars,
+            "max_chars": max_chars,
+            "omitted_chars": original_chars,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            **checkpoint_notice,
+        })
+        return response
+
+    truncated, omitted = _truncate_browser_text(snapshot, max_chars)
+    if omitted > 0:
+        response["snapshot"] = truncated
+        response.update({
+            "truncated": True,
+            "original_chars": original_chars,
+            "max_chars": max_chars,
+            "omitted_chars": omitted,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            "repair_hint": (
+                f"{source} returned a bounded page snapshot for this Vesta run. "
+                "Use browser_extract for normalized evidence, targeted browser "
+                "interactions, or checkpoint findings before broad page inspection."
+            ),
+        })
+    return response
+
+
+def _bound_browser_eval_response(raw_json: str, source: str) -> str:
+    limit_info = _browser_text_output_limit_info(source)
+    if not (limit_info.get("vesta_active") and limit_info.get("disciplined")):
+        return raw_json
+
+    try:
+        payload = json.loads(raw_json)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        max_chars = int(limit_info.get("max_bytes") or 0)
+        truncated, omitted = _truncate_browser_text(raw_json, max_chars)
+        if omitted <= 0:
+            return raw_json
+        return json.dumps({
+            "success": True,
+            "result": truncated,
+            "result_type": "truncated_text",
+            "truncated": True,
+            "original_chars": len(str(raw_json or "")),
+            "max_chars": max_chars,
+            "omitted_chars": omitted,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            "repair_hint": (
+                "browser_console expression returned bounded text for this Vesta run. "
+                "Use a narrower JavaScript expression or checkpoint the relevant subset."
+            ),
+        }, ensure_ascii=False)
+
+    if not isinstance(payload, dict):
+        return raw_json
+    try:
+        result_text = json.dumps(payload.get("result"), ensure_ascii=False, default=str)
+    except Exception:
+        result_text = str(payload.get("result") or "")
+
+    max_chars = int(limit_info.get("max_bytes") or 0)
+    truncated, omitted = _truncate_browser_text(result_text, max_chars)
+    if omitted <= 0:
+        return raw_json
+
+    payload["result"] = truncated
+    payload["result_truncated"] = True
+    payload["result_original_chars"] = len(result_text)
+    payload["result_omitted_chars"] = omitted
+    payload["truncated"] = True
+    payload["max_chars"] = max_chars
+    payload["max_chars_source"] = limit_info.get("source")
+    payload["context_length_tokens"] = limit_info.get("context_length_tokens")
+    payload["repair_hint"] = (
+        "browser_console expression returned a bounded JSON/text preview for this Vesta run. "
+        "Use a narrower JavaScript expression or checkpoint the relevant subset."
+    )
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _coerce_browser_extract_max_chars(max_chars: Optional[int]) -> int:
+    try:
+        value = int(max_chars or _BROWSER_EXTRACT_DEFAULT_MAX_CHARS)
+    except (TypeError, ValueError):
+        value = _BROWSER_EXTRACT_DEFAULT_MAX_CHARS
+    return max(1_000, min(value, _BROWSER_EXTRACT_MAX_CHARS))
+
+
+def _browser_extract_limit_info(max_chars: Optional[int]) -> Dict[str, Any]:
+    configured = _coerce_browser_extract_max_chars(max_chars)
+    info: Dict[str, Any] = {
+        "max_chars": configured,
+        "source": "browser_extract",
+        "vesta_active": False,
+        "disciplined": False,
+    }
+    try:
+        from vesta_runtime import get_current_run
+
+        if get_current_run() is None:
+            return info
+        info["vesta_active"] = True
+    except Exception:
+        return info
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        vesta = cfg.get("vesta", {}) if isinstance(cfg, dict) else {}
+        retrieval = vesta.get("retrieval", {}) if isinstance(vesta, dict) else {}
+        if not isinstance(retrieval, dict):
+            return info
+        if str(retrieval.get("mode", "disciplined")).strip().lower() != "disciplined":
+            return info
+        threshold = int(retrieval.get("broad_read_byte_threshold") or configured)
+        if threshold <= 0:
+            return info
+    except Exception:
+        return info
+
+    info["disciplined"] = True
+    capped = max(1_000, min(configured, threshold))
+    try:
+        from tools.tool_output_limits import apply_vesta_context_byte_cap
+
+        capped, context_capped, context_length = apply_vesta_context_byte_cap(capped)
+        if context_capped:
+            info["source"] = "vesta_context_retrieval"
+            info["context_length_tokens"] = context_length
+    except Exception:
+        context_capped = False
+    info["max_chars"] = max(1_000, capped)
+    if info["max_chars"] < configured:
+        if not context_capped:
+            info["source"] = "vesta_retrieval"
+    return info
+
+
+def _browser_extract_script(selector: Optional[str]) -> str:
+    selector_json = json.dumps(selector.strip() if selector else None)
+    limit = _BROWSER_EXTRACT_INPUT_MAX_CHARS
+    return f"""
+(() => {{
+  const selector = {selector_json};
+  const root = selector ? document.querySelector(selector) : document.documentElement;
+  if (!root) {{
+    return JSON.stringify({{
+      error: `No element matched selector: ${{selector}}`,
+      selector,
+      url: location.href,
+      title: document.title || ""
+    }});
+  }}
+  const html = root.outerHTML || root.innerHTML || "";
+  const text = (root.innerText || document.body?.innerText || "").trim();
+  return JSON.stringify({{
+    url: location.href,
+    title: document.title || "",
+    selector,
+    html: html.slice(0, {limit}),
+    text: text.slice(0, {limit}),
+    html_chars: html.length,
+    text_chars: text.length,
+    html_truncated: html.length > {limit},
+    text_truncated: text.length > {limit}
+  }});
+}})()
+""".strip()
+
+
+def _clean_normalized_markdown(content: str) -> str:
+    lines = [line.rstrip() for line in str(content or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    cleaned: List[str] = []
+    blank_run = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank_run += 1
+            if blank_run <= 1:
+                cleaned.append("")
+            continue
+        blank_run = 0
+        cleaned.append(stripped)
+    return "\n".join(cleaned).strip()
+
+
+def _normalize_rendered_html(html: str, text: str, url: str) -> Tuple[str, str, Optional[str]]:
+    warnings: Optional[str] = None
+    normalized = ""
+    normalizer = "dom_inner_text_fallback"
+    try:
+        import trafilatura  # type: ignore[import-not-found]
+
+        extracted = trafilatura.extract(
+            html,
+            url=url or None,
+            output_format="markdown",
+            include_tables=True,
+            include_images=True,
+            include_links=True,
+            include_formatting=True,
+            favor_recall=True,
+            deduplicate=True,
+        )
+        if extracted and extracted.strip():
+            normalized = extracted
+            normalizer = "trafilatura"
+    except Exception as exc:
+        warnings = f"trafilatura unavailable or failed; used rendered text fallback ({exc})."
+
+    if not normalized.strip():
+        normalized = text or ""
+        if warnings is None:
+            warnings = "trafilatura returned no extractable content; used rendered text fallback."
+
+    return _clean_normalized_markdown(normalized), normalizer, warnings
+
+
+def _truncate_normalized_content(content: str, max_chars: int) -> Tuple[str, int]:
+    if len(content) <= max_chars:
+        return content, 0
+    cutoff = content.rfind("\n", 0, max_chars)
+    if cutoff < int(max_chars * 0.75):
+        cutoff = max_chars
+    truncated = content[:cutoff].rstrip()
+    return truncated, len(content) - len(truncated)
+
+
+def _browser_extract_bot_warning(title: str, content: str) -> Optional[str]:
+    haystack = f"{title}\n{content[:1000]}".lower()
+    blocked_patterns = [
+        "access denied", "access to this page has been denied",
+        "blocked", "bot detected", "verification required",
+        "please verify", "are you a robot", "captcha",
+        "cloudflare", "ddos protection", "checking your browser",
+        "just a moment", "attention required",
+    ]
+    if any(pattern in haystack for pattern in blocked_patterns):
+        return (
+            "Rendered content resembles a bot-detection or verification page. "
+            "Use browser_vision or a different browser session/profile before treating this as source evidence."
+        )
+    return None
+
+
+def _browser_extract_fingerprint(url: str, selector: Any, content: str) -> str:
+    raw = "\0".join([str(url or ""), str(selector or ""), str(content or "")])
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _browser_extract_duplicate_seen(task_id: Optional[str], fingerprint: str) -> bool:
+    key = task_id or "default"
+    with _BROWSER_EXTRACT_SEEN_LOCK:
+        seen = _BROWSER_EXTRACT_SEEN_BY_TASK.setdefault(key, set())
+        if fingerprint in seen:
+            return True
+        seen.add(fingerprint)
+    return False
+
+
+def _browser_extract_page_budget_exceeded(
+    task_id: Optional[str],
+    url: str,
+    selector: Any,
+) -> tuple[bool, int]:
+    key = task_id or "default"
+    page_key = (str(url or ""), str(selector or ""))
+    with _BROWSER_EXTRACT_SEEN_LOCK:
+        counts = _BROWSER_EXTRACT_COUNT_BY_TASK.setdefault(key, {})
+        count = counts.get(page_key, 0) + 1
+        counts[page_key] = count
+    return count > _BROWSER_EXTRACT_MAX_PER_PAGE, count
+
+
+def browser_extract(
+    selector: Optional[str] = None,
+    max_chars: Optional[int] = None,
+    task_id: Optional[str] = None,
+) -> str:
+    """Extract normalized markdown from the currently rendered browser page."""
+    limit_info = _browser_extract_limit_info(max_chars)
+    max_chars_value = int(limit_info["max_chars"])
+    eval_result = json.loads(_browser_eval(_browser_extract_script(selector), task_id))
+    if not eval_result.get("success"):
+        return json.dumps({
+            "success": False,
+            "error": eval_result.get("error", "Failed to read rendered page content"),
+        }, ensure_ascii=False)
+
+    payload = eval_result.get("result")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            payload = {"text": payload}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if payload.get("error"):
+        return json.dumps({
+            "success": False,
+            "error": payload["error"],
+            "url": payload.get("url", ""),
+            "title": payload.get("title", ""),
+            "selector": payload.get("selector"),
+        }, ensure_ascii=False)
+
+    url = str(payload.get("url") or "")
+    title = str(payload.get("title") or "")
+    html = str(payload.get("html") or "")
+    text = str(payload.get("text") or "")
+    content, normalizer, warning = _normalize_rendered_html(html, text, url)
+    full_chars = len(content)
+    fingerprint = _browser_extract_fingerprint(url, payload.get("selector"), content)
+    if limit_info.get("vesta_active"):
+        page_budget_exceeded, page_extract_count = _browser_extract_page_budget_exceeded(
+            task_id,
+            url,
+            payload.get("selector"),
+        )
+        if page_budget_exceeded:
+            return json.dumps({
+                "success": True,
+                "source": "browser_rendered",
+                "content_format": "normalized_markdown",
+                "content_note": (
+                    "This is a compact repeat-extraction notice for normalized "
+                    "rendered-page content, not raw HTML, JavaScript, DOM nodes, "
+                    "browser element refs, or a live page."
+                ),
+                "url": url,
+                "title": title,
+                "selector": payload.get("selector"),
+                "normalizer": normalizer,
+                "repeat_extract_limit_exceeded": True,
+                "page_extract_count": page_extract_count,
+                "page_extract_limit": _BROWSER_EXTRACT_MAX_PER_PAGE,
+                "content": "",
+                "chars": 0,
+                "lines": 0,
+                "full_chars": full_chars,
+                "omitted_chars": full_chars,
+                "truncated": True,
+                "max_chars": max_chars_value,
+                "max_chars_source": limit_info["source"],
+                "context_length_tokens": limit_info.get("context_length_tokens"),
+                "raw_html_chars": int(payload.get("html_chars") or len(html)),
+                "raw_text_chars": int(payload.get("text_chars") or len(text)),
+                "raw_input_truncated": bool(payload.get("html_truncated") or payload.get("text_truncated")),
+                "repair_hint": (
+                    "This Vesta run has already extracted this rendered page several "
+                    "times. Use the existing evidence, change URL/selector/interaction "
+                    "for a specific missing signal, write a checkpoint/artifact section, "
+                    "or record a coverage gap instead of broad-extracting the same page."
+                ),
+            }, ensure_ascii=False)
+    if limit_info.get("vesta_active") and _browser_extract_duplicate_seen(task_id, fingerprint):
+        return json.dumps({
+            "success": True,
+            "source": "browser_rendered",
+            "content_format": "normalized_markdown",
+            "content_note": (
+                "This is a compact duplicate notice for normalized rendered-page content, "
+                "not raw HTML, JavaScript, DOM nodes, browser element refs, or a live page."
+            ),
+            "url": url,
+            "title": title,
+            "selector": payload.get("selector"),
+            "normalizer": normalizer,
+            "duplicate": True,
+            "content": "",
+            "chars": 0,
+            "lines": 0,
+            "full_chars": full_chars,
+            "omitted_chars": full_chars,
+            "truncated": True,
+            "max_chars": max_chars_value,
+            "max_chars_source": limit_info["source"],
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            "raw_html_chars": int(payload.get("html_chars") or len(html)),
+            "raw_text_chars": int(payload.get("text_chars") or len(text)),
+            "raw_input_truncated": bool(payload.get("html_truncated") or payload.get("text_truncated")),
+            "repair_hint": (
+                "The same URL/selector produced the same normalized content already returned "
+                "in this task. Use the existing evidence, change selector/interaction, or "
+                "record a gap instead of repeating this extraction."
+            ),
+        }, ensure_ascii=False)
+    content, omitted_chars = _truncate_normalized_content(content, max_chars_value)
+
+    warnings = []
+    if warning:
+        warnings.append(warning)
+    bot_warning = _browser_extract_bot_warning(title, content)
+    if bot_warning:
+        warnings.append(bot_warning)
+
+    response = {
+        "success": True,
+        "source": "browser_rendered",
+        "content_format": "normalized_markdown",
+        "content_note": (
+            "This is normalized rendered-page content, not raw HTML, JavaScript, DOM nodes, "
+            "browser element refs, or a live page. If it is incomplete, interact/scroll/page "
+            "in the browser and call browser_extract again."
+        ),
+        "url": url,
+        "title": title,
+        "selector": payload.get("selector"),
+        "normalizer": normalizer,
+        "content": content,
+        "chars": len(content),
+        "lines": content.count("\n") + 1 if content else 0,
+        "full_chars": full_chars,
+        "omitted_chars": omitted_chars,
+        "truncated": omitted_chars > 0,
+        "max_chars": max_chars_value,
+        "max_chars_source": limit_info["source"],
+        "context_length_tokens": limit_info.get("context_length_tokens"),
+        "raw_html_chars": int(payload.get("html_chars") or len(html)),
+        "raw_text_chars": int(payload.get("text_chars") or len(text)),
+        "raw_input_truncated": bool(payload.get("html_truncated") or payload.get("text_truncated")),
+    }
+    if omitted_chars > 0:
+        response["repair_hint"] = (
+            "browser_extract returned a bounded normalized markdown excerpt. "
+            "Use a CSS selector, interact with the rendered page, or request a targeted "
+            "follow-up window instead of repeating the same broad extraction."
+        )
+    if warnings:
+        response["warnings"] = warnings
+    if limit_info.get("vesta_active"):
+        try:
+            from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+            checkpoint_notice = vesta_evidence_checkpoint_notice("browser_extract")
+        except Exception:
+            checkpoint_notice = None
+        if checkpoint_notice:
+            response.update({
+                "content": "",
+                "chars": 0,
+                "lines": 0,
+                "omitted_chars": full_chars,
+                "truncated": True,
+                **checkpoint_notice,
+            })
+    return json.dumps(response, ensure_ascii=False)
 
 
 def browser_click(ref: str, task_id: Optional[str] = None) -> str:
@@ -2643,7 +3239,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     """
     # --- JS evaluation mode ---
     if expression is not None:
-        return _browser_eval(expression, task_id)
+        return _bound_browser_eval_response(
+            _browser_eval(expression, task_id),
+            "browser_console_eval",
+        )
 
     # --- Console output mode (original behaviour) ---
     if _is_camofox_mode():
@@ -2685,6 +3284,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     _copy_fallback_warning(response, console_result)
     if errors_result.get("fallback_warning") and not response.get("fallback_warning"):
         _copy_fallback_warning(response, errors_result)
+    response = _apply_browser_console_budget(
+        response,
+        _browser_text_output_limit_info("browser_console"),
+    )
     return json.dumps(response, ensure_ascii=False)
 
 
@@ -3607,6 +4210,19 @@ registry.register(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
     emoji="📸",
+)
+registry.register(
+    name="browser_extract",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_extract"],
+    handler=lambda args, **kw: browser_extract(
+        selector=args.get("selector"),
+        max_chars=args.get("max_chars"),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="📄",
+    max_result_size_chars=60_000,
 )
 registry.register(
     name="browser_click",

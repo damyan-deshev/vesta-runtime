@@ -1286,6 +1286,12 @@ class TestSummaryTargetRatio:
         # 50% of 100K = 50K, but the floor is 64K
         assert c.threshold_tokens == 64_000
 
+    def test_threshold_floor_keeps_headroom_near_minimum_context(self):
+        """The 64K floor must not consume the whole window on 64K-class models."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=65_536):
+            c = ContextCompressor(model="test", quiet_mode=True, threshold_percent=0.75)
+        assert c.threshold_tokens == int(65_536 * 0.80)
+
     def test_threshold_floor_does_not_apply_above_128k(self):
         """On large-context models the 50% percentage is used directly."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):

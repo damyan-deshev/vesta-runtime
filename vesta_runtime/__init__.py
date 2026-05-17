@@ -23,6 +23,7 @@ from .state import (
     set_current_run,
     run_status,
     write_control_plane_snapshot,
+    write_research_artifact_section,
     write_resume_packet,
     write_handoff,
     write_finalization,
@@ -34,6 +35,7 @@ from .eval_contract import (
     enforce_eval_contract,
     eval_mode_enabled,
     seed_eval_contract_from_prompt,
+    validate_delegate_task_against_eval_contract,
 )
 from .closure import build_closure_prompt_contract
 
@@ -56,6 +58,7 @@ __all__ = [
     "set_current_run",
     "run_status",
     "write_control_plane_snapshot",
+    "write_research_artifact_section",
     "write_resume_packet",
     "write_handoff",
     "write_finalization",
@@ -66,5 +69,6 @@ __all__ = [
     "enforce_eval_contract",
     "eval_mode_enabled",
     "seed_eval_contract_from_prompt",
+    "validate_delegate_task_against_eval_contract",
     "build_closure_prompt_contract",
 ]

@@ -59,6 +59,220 @@ def _get_max_read_chars() -> int:
     _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
     return _max_read_chars_cached
 
+
+def _get_read_output_limit_info() -> dict:
+    configured = _get_max_read_chars()
+    try:
+        from tools.tool_output_limits import get_vesta_retrieval_output_limit_info
+
+        return get_vesta_retrieval_output_limit_info(
+            configured,
+            source="file_read_max_chars",
+        )
+    except Exception:
+        return {
+            "max_bytes": configured,
+            "source": "file_read_max_chars",
+            "vesta_active": False,
+            "disciplined": False,
+        }
+
+
+def _get_search_output_limit_info() -> dict:
+    try:
+        from tools.tool_output_limits import (
+            get_tool_output_limits,
+            get_vesta_retrieval_output_limit_info,
+        )
+
+        configured = int(get_tool_output_limits()["max_bytes"])
+        return get_vesta_retrieval_output_limit_info(
+            configured,
+            source="search_files",
+        )
+    except Exception:
+        return {
+            "max_bytes": 50_000,
+            "source": "search_files",
+            "vesta_active": False,
+            "disciplined": False,
+        }
+
+
+def _search_result_json(result_dict: dict) -> str:
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
+def _with_search_budget_metadata(
+    result_dict: dict,
+    *,
+    original_chars: int,
+    max_chars: int,
+    limit_info: dict,
+) -> dict:
+    result_dict["truncated"] = True
+    result_dict["original_chars"] = original_chars
+    result_dict["max_chars"] = max_chars
+    result_dict["max_chars_source"] = limit_info.get("source")
+    result_dict["context_length_tokens"] = limit_info.get("context_length_tokens")
+    result_dict["repair_hint"] = (
+        "search_files returned bounded output for this Vesta run. "
+        "Use a narrower path/file_glob/pattern, output_mode='count' or "
+        "output_mode='files_only', lower limit/context, then read_file targeted "
+        "windows for the selected sources."
+    )
+    return result_dict
+
+
+def _trim_search_sequence_field(
+    result_dict: dict,
+    *,
+    field: str,
+    original_chars: int,
+    max_chars: int,
+    limit_info: dict,
+) -> dict | None:
+    sequence = result_dict.get(field)
+    if not isinstance(sequence, list):
+        return None
+
+    low = 0
+    high = len(sequence)
+    best: dict | None = None
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = dict(result_dict)
+        candidate[field] = sequence[:mid]
+        candidate[f"returned_{field}_count"] = mid
+        candidate[f"original_{field}_count"] = len(sequence)
+        _with_search_budget_metadata(
+            candidate,
+            original_chars=original_chars,
+            max_chars=max_chars,
+            limit_info=limit_info,
+        )
+        candidate["omitted_chars"] = max(0, original_chars - len(_search_result_json(candidate)))
+        if len(_search_result_json(candidate)) <= max_chars:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _trim_search_counts_field(
+    result_dict: dict,
+    *,
+    original_chars: int,
+    max_chars: int,
+    limit_info: dict,
+) -> dict | None:
+    counts = result_dict.get("counts")
+    if not isinstance(counts, dict):
+        return None
+
+    items = list(counts.items())
+    low = 0
+    high = len(items)
+    best: dict | None = None
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = dict(result_dict)
+        candidate["counts"] = dict(items[:mid])
+        candidate["returned_counts_count"] = mid
+        candidate["original_counts_count"] = len(items)
+        _with_search_budget_metadata(
+            candidate,
+            original_chars=original_chars,
+            max_chars=max_chars,
+            limit_info=limit_info,
+        )
+        candidate["omitted_chars"] = max(0, original_chars - len(_search_result_json(candidate)))
+        if len(_search_result_json(candidate)) <= max_chars:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best
+
+
+def _apply_search_output_budget(result_dict: dict) -> str:
+    limit_info = _get_search_output_limit_info()
+    result_json = _search_result_json(result_dict)
+    if not (limit_info.get("vesta_active") and limit_info.get("disciplined")):
+        return result_json
+
+    max_chars = int(limit_info.get("max_bytes") or 0)
+    original_chars = len(result_json)
+    try:
+        from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+        checkpoint_notice = (
+            vesta_evidence_checkpoint_notice("search_files")
+            if original_chars > min(max_chars, 1_000)
+            else None
+        )
+    except Exception:
+        checkpoint_notice = None
+    if checkpoint_notice:
+        return json.dumps({
+            "matches": [],
+            "files": [],
+            "counts": {},
+            "truncated": True,
+            "original_chars": original_chars,
+            "max_chars": max_chars,
+            "omitted_chars": original_chars,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            **checkpoint_notice,
+        }, ensure_ascii=False)
+
+    if original_chars <= max_chars:
+        return result_json
+
+    for field in ("matches", "files"):
+        trimmed = _trim_search_sequence_field(
+            result_dict,
+            field=field,
+            original_chars=original_chars,
+            max_chars=max_chars,
+            limit_info=limit_info,
+        )
+        if trimmed is not None:
+            return _search_result_json(trimmed)
+
+    trimmed_counts = _trim_search_counts_field(
+        result_dict,
+        original_chars=original_chars,
+        max_chars=max_chars,
+        limit_info=limit_info,
+    )
+    if trimmed_counts is not None:
+        return _search_result_json(trimmed_counts)
+
+    fallback = _with_search_budget_metadata(
+        {"matches": [], "files": [], "counts": {}},
+        original_chars=original_chars,
+        max_chars=max_chars,
+        limit_info=limit_info,
+    )
+    fallback["omitted_chars"] = original_chars
+    return _search_result_json(fallback)
+
+
+def _truncate_read_content_for_vesta(content: str, max_chars: int) -> tuple[str, int]:
+    if len(content) <= max_chars:
+        return content, 0
+    head_chars = int(max_chars * 0.45)
+    tail_chars = max_chars - head_chars
+    omitted = len(content) - head_chars - tail_chars
+    notice = (
+        f"\n\n... [READ_FILE OUTPUT TRUNCATED - {omitted} chars omitted "
+        f"out of {len(content)} total] ...\n\n"
+    )
+    return content[:head_chars] + notice + content[-tail_chars:], omitted
+
 # If the total file size exceeds this AND the caller didn't specify a narrow
 # range (limit <= 200), we include a hint encouraging targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000  # 512 KB
@@ -228,6 +442,16 @@ _READ_DEDUP_STATUS_MESSAGE = (
     "the earlier read_file result in this conversation is "
     "still current — refer to that instead of re-reading."
 )
+_VESTA_READ_TRUNCATION_LIMIT = 4
+_vesta_read_truncation_counts: dict[str, int] = {}
+
+
+def _vesta_read_truncation_budget_exceeded(task_id: str | None) -> tuple[bool, int]:
+    key = task_id or "default"
+    with _read_tracker_lock:
+        count = _vesta_read_truncation_counts.get(key, 0) + 1
+        _vesta_read_truncation_counts[key] = count
+    return count > _VESTA_READ_TRUNCATION_LIMIT, count
 
 
 def _cap_read_tracker_data(task_data: dict) -> None:
@@ -640,20 +864,64 @@ def read_file_tool(
         # Check BEFORE redaction to avoid expensive regex on huge content.
         content_len = len(result.content or "")
         file_size = result_dict.get("file_size", 0)
-        max_chars = _get_max_read_chars()
+        read_limit_info = _get_read_output_limit_info()
+        max_chars = int(read_limit_info["max_bytes"])
         if content_len > max_chars:
-            total_lines = result_dict.get("total_lines", "unknown")
-            return json.dumps({
-                "error": (
-                    f"Read produced {content_len:,} characters which exceeds "
-                    f"the safety limit ({max_chars:,} chars). "
-                    "Use offset and limit to read a smaller range. "
-                    f"The file has {total_lines} lines total."
-                ),
-                "path": path,
-                "total_lines": total_lines,
-                "file_size": file_size,
-            }, ensure_ascii=False)
+            if read_limit_info.get("disciplined") and read_limit_info.get("vesta_active"):
+                budget_exceeded, truncation_count = _vesta_read_truncation_budget_exceeded(task_id)
+                if budget_exceeded:
+                    return json.dumps({
+                        "content": "",
+                        "path": path,
+                        "total_lines": result_dict.get("total_lines", "unknown"),
+                        "file_size": file_size,
+                        "truncated": True,
+                        "original_chars": content_len,
+                        "max_chars": max_chars,
+                        "omitted_chars": content_len,
+                        "max_chars_source": read_limit_info.get("source"),
+                        "context_length_tokens": read_limit_info.get("context_length_tokens"),
+                        "repeat_truncation_limit_exceeded": True,
+                        "truncation_count": truncation_count,
+                        "truncation_limit": _VESTA_READ_TRUNCATION_LIMIT,
+                        "repair_hint": (
+                            "This Vesta run has already received several large "
+                            "read_file evidence windows. Stop broad file retrieval, "
+                            "write/checkpoint concise findings or gaps, then continue "
+                            "only with a targeted offset/limit or search_files result."
+                        ),
+                    }, ensure_ascii=False)
+                truncated_content, omitted = _truncate_read_content_for_vesta(
+                    result.content or "",
+                    max_chars,
+                )
+                result.content = truncated_content
+                result_dict["content"] = truncated_content
+                result_dict["truncated"] = True
+                result_dict["original_chars"] = content_len
+                result_dict["max_chars"] = max_chars
+                result_dict["omitted_chars"] = omitted
+                result_dict["max_chars_source"] = read_limit_info.get("source")
+                result_dict["context_length_tokens"] = read_limit_info.get("context_length_tokens")
+                result_dict["repair_hint"] = (
+                    "read_file returned a bounded Vesta evidence window. "
+                    "Use offset/limit, search_files context, or a targeted section "
+                    "instead of another broad read; checkpoint findings or gaps "
+                    "before requesting more coverage."
+                )
+            else:
+                total_lines = result_dict.get("total_lines", "unknown")
+                return json.dumps({
+                    "error": (
+                        f"Read produced {content_len:,} characters which exceeds "
+                        f"the safety limit ({max_chars:,} chars). "
+                        "Use offset and limit to read a smaller range. "
+                        f"The file has {total_lines} lines total."
+                    ),
+                    "path": path,
+                    "total_lines": total_lines,
+                    "file_size": file_size,
+                }, ensure_ascii=False)
 
         # ── Redact secrets (after guard check to skip oversized content) ──
         if result.content:
@@ -737,6 +1005,28 @@ def read_file_tool(
                 "The content has not changed since your last read. Use the information you already have. "
                 "If you are stuck in a loop, stop reading and proceed with writing or responding."
             )
+
+        if read_limit_info.get("disciplined") and read_limit_info.get("vesta_active"):
+            try:
+                from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+                checkpoint_notice = vesta_evidence_checkpoint_notice("read_file")
+            except Exception:
+                checkpoint_notice = None
+            if checkpoint_notice:
+                return json.dumps({
+                    "content": "",
+                    "path": path,
+                    "total_lines": result_dict.get("total_lines", "unknown"),
+                    "file_size": file_size,
+                    "truncated": True,
+                    "original_chars": content_len,
+                    "max_chars": max_chars,
+                    "omitted_chars": content_len,
+                    "max_chars_source": read_limit_info.get("source"),
+                    "context_length_tokens": read_limit_info.get("context_length_tokens"),
+                    **checkpoint_notice,
+                }, ensure_ascii=False)
 
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
@@ -1120,10 +1410,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "The results have not changed. Use the information you already have."
             )
 
-        result_json = json.dumps(result_dict, ensure_ascii=False)
+        result_json = _apply_search_output_budget(result_dict)
         # Hint when results were truncated — explicit next offset is clearer
         # than relying on the model to infer it from total_count vs match count.
-        if result_dict.get("truncated"):
+        try:
+            _hint_result = json.loads(result_json)
+        except Exception:
+            _hint_result = result_dict
+        if isinstance(_hint_result, dict) and _hint_result.get("truncated"):
             next_offset = offset + limit
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
@@ -1251,12 +1545,92 @@ def _handle_read_file(args, **kw):
     )
 
 
+def _vesta_artifact_write_limit() -> int:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        vesta = cfg.get("vesta", {}) if isinstance(cfg, dict) else {}
+        retrieval = vesta.get("retrieval", {}) if isinstance(vesta, dict) else {}
+        raw = (
+            retrieval.get("broad_read_byte_threshold")
+            if isinstance(retrieval, dict)
+            else None
+        )
+        value = int(raw)
+        return value if value > 0 else 20_000
+    except Exception:
+        return 20_000
+
+
+def _is_vesta_research_artifact_write(path: str) -> bool:
+    try:
+        from vesta_runtime import eval_mode_enabled, get_current_run
+
+        if get_current_run() is None:
+            return False
+        if eval_mode_enabled():
+            return True
+    except Exception:
+        return False
+
+    lowered = path.lower()
+    name = Path(path).name.lower()
+    return "live-eval-artifacts" in lowered or "artifact" in name or "/artifacts/" in lowered
+
+
+def _guard_vesta_markdown_artifact_write(path: str, content: str) -> str | None:
+    if Path(path).suffix.lower() != ".md":
+        return None
+    if not _is_vesta_research_artifact_write(path):
+        return None
+    max_chars = _vesta_artifact_write_limit()
+    content_chars = len(content)
+    if content_chars <= max_chars:
+        return None
+    return tool_error(
+        "write_file rejected an oversized Vesta markdown artifact payload.",
+        success=False,
+        code="vesta_artifact_write_too_large",
+        path=path,
+        content_chars=content_chars,
+        max_chars=max_chars,
+        omitted_chars=content_chars - max_chars,
+        repair_hint=(
+            "Write a compact evidence index or split the artifact into bounded "
+            "sections. For evidence artifacts, use research_artifact_section_write "
+            "instead of one large write_file payload."
+        ),
+    )
+
+
+def _vesta_write_file_repair_hint() -> dict[str, object]:
+    try:
+        from vesta_runtime import eval_mode_enabled, get_current_run
+
+        if not eval_mode_enabled() and get_current_run() is None:
+            return {}
+    except Exception:
+        return {}
+    return {
+        "success": False,
+        "code": "vesta_write_file_args_missing_or_corrupt",
+        "repair_hint": (
+            "If this was a Vesta evidence artifact write, do not retry a single "
+            "large write_file payload. Use research_artifact_section_write with "
+            "bounded sections such as sources, paper_coverage, claims_verdict, "
+            "and gaps; then record/finalize through typed Vesta state tools."
+        ),
+    }
+
+
 def _handle_write_file(args, **kw):
     tid = kw.get("task_id") or "default"
     if not args.get("path") or not isinstance(args.get("path"), str):
         return tool_error(
             "write_file: missing required field 'path'. Re-emit the tool call with "
-            "both 'path' and 'content' set."
+            "both 'path' and 'content' set.",
+            **_vesta_write_file_repair_hint(),
         )
     if "content" not in args:
         return tool_error(
@@ -1264,13 +1638,17 @@ def _handle_write_file(args, **kw):
             "path but no content argument — this is almost always a dropped-arg bug "
             "under context pressure. Re-emit the tool call with the full content "
             "payload, or use execute_code with hermes_tools.write_file() for very "
-            "large files."
+            "large files.",
+            **_vesta_write_file_repair_hint(),
         )
     if not isinstance(args["content"], str):
         return tool_error(
             f"write_file: 'content' must be a string, got "
             f"{type(args['content']).__name__}."
         )
+    guard_error = _guard_vesta_markdown_artifact_write(args["path"], args["content"])
+    if guard_error:
+        return guard_error
     return write_file_tool(path=args["path"], content=args["content"], task_id=tid)
 
 

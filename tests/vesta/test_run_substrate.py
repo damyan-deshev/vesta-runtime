@@ -17,6 +17,7 @@ def test_create_run_seeds_markdown_files_under_hermes_home(monkeypatch, tmp_path
         model="model-a",
         provider="provider-a",
         platform="cli",
+        context_length=65_536,
         run_id="run_test_seed",
     )
 
@@ -33,6 +34,9 @@ def test_create_run_seeds_markdown_files_under_hermes_home(monkeypatch, tmp_path
     assert "Run ID: `run_test_seed`" in run_md
     assert "Hermes Session ID: `session_a`" in run_md
     assert "Hermes Parent Session ID: `parent_a`" in run_md
+    assert "Context Length Tokens: `65536`" in run_md
+    assert run.context_length == 65_536
+    assert get_current_run().context_length == 65_536
     assert "# Vesta Ledger" in ledger
     assert "## Entries" in ledger
     assert get_current_run() == run
@@ -61,6 +65,39 @@ def test_agent_initializes_vesta_run_at_session_start():
     assert f"Hermes Session ID: `{agent.session_id}`" in run_md
     assert "Task ID: `task_start`" in run_md
     assert run.run_id != agent.session_id
+
+
+def test_agent_vesta_run_uses_smaller_custom_provider_context():
+    set_current_run(None)
+
+    agent = AIAgent(
+        model="test/small-context",
+        provider="test",
+        api_key="test",
+        base_url="http://localhost:9/v1",
+        quiet_mode=True,
+        skip_memory=True,
+        enabled_toolsets=[],
+    )
+    agent.context_compressor.context_length = 196_608
+    agent._custom_providers = [
+        {
+            "base_url": "http://localhost:9/v1",
+            "models": {
+                "test/small-context": {
+                    "context_length": 65_536,
+                },
+            },
+        }
+    ]
+
+    agent._ensure_vesta_run(task_id="task_small_context")
+    run = agent.vesta_run
+
+    assert run is not None
+    assert run.context_length == 65_536
+    run_md = run.run_md_path.read_text(encoding="utf-8")
+    assert "Context Length Tokens: `65536`" in run_md
 
 
 def test_record_session_rotation_updates_run_and_ledger(tmp_path):

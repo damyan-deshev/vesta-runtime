@@ -67,6 +67,7 @@ class VestaRun:
     raw_dir: Path
     raw_index_path: Path
     created_at: str
+    context_length: int | None = None
 
 
 def _timestamp() -> str:
@@ -163,6 +164,10 @@ def _set_env_for_run(run: VestaRun) -> None:
     os.environ["VESTA_RUN_ID"] = run.run_id
     os.environ["VESTA_RUN_DIR"] = str(run.run_dir)
     os.environ["VESTA_LEDGER_PATH"] = str(run.ledger_path)
+    if run.context_length and run.context_length > 0:
+        os.environ["VESTA_CONTEXT_LENGTH_TOKENS"] = str(run.context_length)
+    else:
+        os.environ.pop("VESTA_CONTEXT_LENGTH_TOKENS", None)
 
 
 def set_current_run(run: VestaRun | None) -> None:
@@ -172,7 +177,12 @@ def set_current_run(run: VestaRun | None) -> None:
     if run is not None:
         _set_env_for_run(run)
     else:
-        for key in ("VESTA_RUN_ID", "VESTA_RUN_DIR", "VESTA_LEDGER_PATH"):
+        for key in (
+            "VESTA_RUN_ID",
+            "VESTA_RUN_DIR",
+            "VESTA_LEDGER_PATH",
+            "VESTA_CONTEXT_LENGTH_TOKENS",
+        ):
             os.environ.pop(key, None)
 
 
@@ -192,6 +202,10 @@ def _run_from_env() -> VestaRun | None:
     ledger_path = Path(ledger_raw) if ledger_raw else run_dir / "ledger.md"
     workspace_path = os.getenv("VESTA_WORKSPACE_PATH") or ""
     workspace_hash = os.getenv("VESTA_WORKSPACE_HASH") or ""
+    try:
+        context_length = int(os.getenv("VESTA_CONTEXT_LENGTH_TOKENS") or "0") or None
+    except (TypeError, ValueError):
+        context_length = None
     run = VestaRun(
         run_id=run_id,
         workspace_hash=workspace_hash,
@@ -209,6 +223,7 @@ def _run_from_env() -> VestaRun | None:
         raw_dir=run_dir / "raw",
         raw_index_path=run_dir / "raw" / "index.md",
         created_at="",
+        context_length=context_length,
     )
     if run.run_dir.exists():
         set_current_run(run)
@@ -225,6 +240,7 @@ def create_run(
     model: str | None = None,
     provider: str | None = None,
     platform: str | None = None,
+    context_length: int | None = None,
     run_id: str | None = None,
     resumes_run_id: str | None = None,
     recovery_of_run_id: str | None = None,
@@ -236,6 +252,10 @@ def create_run(
     resolved_workspace = _workspace_path(workspace_path)
     workspace_hash = _workspace_hash(resolved_workspace)
     created_at = _timestamp()
+    try:
+        resolved_context_length = int(context_length or 0) or None
+    except (TypeError, ValueError):
+        resolved_context_length = None
     rid = run_id or _new_run_id()
     run_dir = get_hermes_home() / "vesta" / "workspaces" / workspace_hash / "runs" / rid
     raw_dir = run_dir / "raw"
@@ -271,6 +291,7 @@ def create_run(
         raw_dir=raw_dir,
         raw_index_path=raw_dir / "index.md",
         created_at=created_at,
+        context_length=resolved_context_length,
     )
 
     _write_if_missing(run.run_md_path, _render_run_seed(
@@ -281,6 +302,7 @@ def create_run(
         model=model,
         provider=provider,
         platform=platform,
+        context_length=resolved_context_length,
         lineage=lineage,
     ))
     _write_if_missing(run.ledger_path, _render_ledger_seed(run, session_id=session_id))
@@ -318,6 +340,7 @@ def _render_run_seed(
     model: str | None,
     provider: str | None,
     platform: str | None,
+    context_length: int | None,
     lineage: dict[str, str] | None = None,
 ) -> str:
     parent = parent_session_id or ""
@@ -337,6 +360,7 @@ Task ID: `{task_id or ''}`
 Model: `{model or ''}`
 Provider: `{provider or ''}`
 Platform: `{platform or ''}`
+Context Length Tokens: `{context_length or ''}`
 
 ## Hermes Session Lineage
 
@@ -857,6 +881,12 @@ def _path_is_within_run(path: Path, run: VestaRun) -> bool:
 
 ARTIFACT_STATUSES = {"expected", "exists", "missing", "superseded", "purged"}
 _NON_LOCAL_ARTIFACT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+RESEARCH_ARTIFACT_SECTIONS = {
+    "sources": "Sources",
+    "paper_coverage": "Paper Coverage",
+    "claims_verdict": "Claims / Verdict",
+    "gaps": "Gaps",
+}
 
 
 def _is_local_artifact_path(path: str) -> bool:
@@ -986,6 +1016,122 @@ def record_artifact(
         "verified": verification.get("verified", False),
         "content_hash": verification.get("content_hash"),
         "verification_note": verification.get("verification_note", ""),
+    }
+
+
+def _research_artifact_section_limit() -> int:
+    retrieval = _active_vesta_config().get("retrieval", {})
+    try:
+        value = int(retrieval.get("broad_read_byte_threshold", 20_000))
+    except (TypeError, ValueError):
+        value = 20_000
+    return value if value > 0 else 20_000
+
+
+def _normalize_research_artifact_section(section: str) -> tuple[str, str]:
+    key = re.sub(r"[^a-z0-9]+", "_", (section or "").strip().lower()).strip("_")
+    aliases = {
+        "paper": "paper_coverage",
+        "papers": "paper_coverage",
+        "coverage": "paper_coverage",
+        "claims": "claims_verdict",
+        "verdict": "claims_verdict",
+        "claims_and_verdict": "claims_verdict",
+        "claims_verdict": "claims_verdict",
+        "claim_verdict": "claims_verdict",
+        "source": "sources",
+        "gap": "gaps",
+    }
+    key = aliases.get(key, key)
+    if key not in RESEARCH_ARTIFACT_SECTIONS:
+        allowed = ", ".join(sorted(RESEARCH_ARTIFACT_SECTIONS))
+        raise ValueError(f"Unsupported research artifact section `{section}`. Use one of: {allowed}.")
+    return key, RESEARCH_ARTIFACT_SECTIONS[key]
+
+
+def write_research_artifact_section(
+    *,
+    path: str,
+    section: str,
+    content: str,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Append one bounded section to a Vesta research artifact."""
+
+    run = ensure_current_run(session_id=session_id)
+    if not path.strip():
+        raise ValueError("Research artifact path is required")
+    if not isinstance(content, str):
+        raise TypeError("Research artifact section content must be a string")
+    section_key, section_title = _normalize_research_artifact_section(section)
+    max_chars = _research_artifact_section_limit()
+    content_chars = len(content)
+    if content_chars > max_chars:
+        raise ValueError(
+            "Research artifact section is too large: "
+            f"{content_chars} chars exceeds limit {max_chars}. "
+            "Split the section or write a compact evidence index."
+        )
+
+    artifact_path = _resolve_artifact_path(path, run)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = _timestamp()
+    header = (
+        "# Vesta Research Artifact\n\n"
+        f"Run ID: `{run.run_id}`\n"
+        f"Created At: `{timestamp}`\n"
+        f"Path: `{path}`\n"
+    )
+    section_block = (
+        f"\n\n## {section_title}\n\n"
+        f"- Section Key: `{section_key}`\n"
+        f"- Appended At: `{timestamp}`\n"
+        f"- Content Chars: `{content_chars}`\n\n"
+        f"{content.strip()}\n"
+    )
+
+    with _STATE_LOCK:
+        if not artifact_path.exists():
+            artifact_path.write_text(header, encoding="utf-8")
+        with artifact_path.open("a", encoding="utf-8") as f:
+            f.write(section_block)
+
+    artifact = record_artifact(
+        path=path,
+        artifact_type="research_artifact",
+        expected_by="research_artifact_section_write",
+        status="exists",
+        impact_if_missing="Research artifact section writer produced this report.",
+        session_id=session_id,
+    )
+    append_ledger_entry(
+        entry_type="artifact",
+        title=f"Research artifact section appended: {section_title}",
+        statement=f"Section `{section_key}` appended to research artifact `{path}`.",
+        refs=[path, str(artifact_path), str(run.artifact_manifest_path)],
+        status="exists",
+        materiality="medium",
+        session_id=session_id,
+        actor="runtime",
+        structured_payload={
+            "section": section_key,
+            "path": path,
+            "canonical_path": str(artifact_path),
+            "content_chars": content_chars,
+            "max_chars": max_chars,
+        },
+    )
+    return {
+        "run_id": run.run_id,
+        "path": path,
+        "canonical_path": str(artifact_path),
+        "section": section_key,
+        "section_title": section_title,
+        "content_chars": content_chars,
+        "max_chars": max_chars,
+        "artifact_manifest_path": str(run.artifact_manifest_path),
+        "artifact_status": artifact.get("status"),
+        "artifact_verified": artifact.get("verified", False),
     }
 
 
@@ -1546,6 +1692,7 @@ def write_control_plane_snapshot(
     finalization_status = _finalization_status(run)
     validator_state = _validator_finalization_state(run)
     worker_state = _worker_finalization_state(run)
+    artifacts = _latest_artifact_blocks(run)
     resolved_next_action = (next_action or "").strip() or _latest_ledger_next_action(run) or "Consult ledger."
 
     content = f"""# Vesta Control Plane Snapshot
@@ -1578,6 +1725,10 @@ Source Of Truth: Vesta artifact files in `{run.run_dir}`
 ## Worker Summary
 
 {_render_worker_summary(worker_state)}
+
+## Artifact Summary
+
+{_render_artifact_list(artifacts)}
 
 ## Finalization Excerpt
 

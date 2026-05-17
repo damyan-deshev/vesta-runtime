@@ -23,6 +23,7 @@ from vesta_runtime import (
     write_control_plane_snapshot,
     write_finalization,
     write_handoff,
+    write_research_artifact_section,
 )
 
 
@@ -411,6 +412,34 @@ HANDOFF_GENERATE_SCHEMA = {
     },
 }
 
+RESEARCH_ARTIFACT_SECTION_WRITE_SCHEMA = {
+    "name": "research_artifact_section_write",
+    "description": (
+        "Append one bounded section to a Vesta evidence artifact and record it "
+        "in the artifact manifest. Use instead of one large markdown write_file "
+        "payload for evidence-heavy outputs."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Evidence artifact path to create or append.",
+            },
+            "section": {
+                "type": "string",
+                "enum": ["sources", "paper_coverage", "claims_verdict", "gaps"],
+                "description": "Report section being appended.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Bounded markdown content for this section only.",
+            },
+        },
+        "required": ["path", "section", "content"],
+    },
+}
+
 
 def _handle_ledger_append(args, **kw) -> str:
     try:
@@ -649,6 +678,49 @@ def _handle_handoff_generate(args, **kw) -> str:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def _handle_research_artifact_section_write(args, **kw) -> str:
+    if not isinstance(args, dict):
+        args = {}
+    missing = [
+        key
+        for key in ("path", "section", "content")
+        if key not in args or (key != "content" and not args.get(key))
+    ]
+    if missing:
+        return json.dumps(
+            {
+                "success": False,
+                "code": "vesta_research_artifact_section_args_missing_or_corrupt",
+                "error": (
+                    "research_artifact_section_write missing required field(s): "
+                    + ", ".join(missing)
+                ),
+                "repair_hint": (
+                    "Retry with one bounded evidence artifact section: path, section "
+                    "(sources, paper_coverage, claims_verdict, or gaps), and compact "
+                    "content. Do not fall back to one large write_file payload."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    try:
+        result = write_research_artifact_section(
+            path=args.get("path", ""),
+            section=args.get("section", ""),
+            content=args.get("content", ""),
+            session_id=os.getenv("HERMES_SESSION_ID", ""),
+        )
+        try:
+            from tools.tool_output_limits import note_vesta_artifact_checkpoint
+
+            note_vesta_artifact_checkpoint()
+        except Exception:
+            pass
+        return json.dumps({"success": True, **result}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
 registry.register(
     name="ledger_append",
     toolset="vesta",
@@ -781,6 +853,15 @@ registry.register(
     schema=HANDOFF_GENERATE_SCHEMA,
     handler=_handle_handoff_generate,
     emoji="🧷",
+    max_result_size_chars=20_000,
+)
+
+registry.register(
+    name="research_artifact_section_write",
+    toolset="vesta",
+    schema=RESEARCH_ARTIFACT_SECTION_WRITE_SCHEMA,
+    handler=_handle_research_artifact_section_write,
+    emoji="🧾",
     max_result_size_chars=20_000,
 )
 

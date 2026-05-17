@@ -14,7 +14,7 @@ unclosed brackets, Python None) don't kill the session.
 import json
 import pytest
 
-from run_agent import _repair_tool_call_arguments
+from run_agent import _empty_arg_repair_is_safe_to_execute, _repair_tool_call_arguments
 
 
 class TestStreamingAssemblyRepair:
@@ -114,3 +114,21 @@ class TestStreamingAssemblyRepair:
         parsed = json.loads(result)
         assert parsed["command"] == "ls -la /tmp"
         assert parsed["timeout"] == 30
+
+    def test_unrepairable_write_file_empty_args_can_reach_handler(self):
+        """write_file validates empty args and returns a tool-level repair hint."""
+        raw = '{"path":"/tmp/report.md","content":'
+        assert _repair_tool_call_arguments(raw, "write_file") == "{}"
+        assert _empty_arg_repair_is_safe_to_execute("write_file")
+
+    def test_unrepairable_artifact_section_empty_args_can_reach_handler(self):
+        """Typed evidence artifact writes validate empty args without side effects."""
+        raw = '{"path":"/tmp/report.md","section":"claims_verdict","content":'
+        assert _repair_tool_call_arguments(raw, "research_artifact_section_write") == "{}"
+        assert _empty_arg_repair_is_safe_to_execute("research_artifact_section_write")
+
+    def test_unrepairable_terminal_empty_args_still_use_truncation_path(self):
+        """Do not execute arbitrary tools with fabricated empty args by default."""
+        raw = '{"command":"python long_script.py","timeout":'
+        assert _repair_tool_call_arguments(raw, "terminal") == "{}"
+        assert not _empty_arg_repair_is_safe_to_execute("terminal")

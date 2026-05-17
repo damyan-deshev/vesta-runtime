@@ -15,6 +15,10 @@ Port-tracking: anomalyco/opencode PR #23770
 
 from __future__ import annotations
 
+import json
+import shlex
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -115,6 +119,207 @@ class TestShortcuts:
             assert tol.get_max_lines() == 222
             assert tol.get_max_line_length() == 333
 
+    def test_terminal_max_bytes_uses_tool_output_without_vesta_run(self):
+        cfg = {
+            "tool_output": {"max_bytes": 75_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 12_000,
+                }
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("vesta_runtime.get_current_run", return_value=None):
+            assert tol.get_terminal_max_bytes() == 75_000
+
+    def test_terminal_max_bytes_uses_vesta_retrieval_cap_for_active_run(self):
+        cfg = {
+            "tool_output": {"max_bytes": 75_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 12_000,
+                }
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("vesta_runtime.get_current_run", return_value=object()):
+            assert tol.get_terminal_max_bytes() == 12_000
+            info = tol.get_terminal_output_limit_info()
+        assert info["max_bytes"] == 12_000
+        assert info["source"] == "vesta_retrieval"
+        assert info["vesta_active"] is True
+        assert info["disciplined"] is True
+
+    def test_terminal_max_bytes_tightens_for_small_vesta_context(self, monkeypatch):
+        cfg = {
+            "tool_output": {"max_bytes": 75_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 20_000,
+                }
+            },
+        }
+        monkeypatch.setenv("VESTA_CONTEXT_LENGTH_TOKENS", "65536")
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("vesta_runtime.get_current_run", return_value=object()):
+            info = tol.get_terminal_output_limit_info()
+        assert info["max_bytes"] == 8192
+        assert info["source"] == "vesta_context_retrieval"
+        assert info["context_length_tokens"] == 65536
+
+    def test_terminal_max_bytes_ignores_vesta_cap_in_permissive_mode(self):
+        cfg = {
+            "tool_output": {"max_bytes": 75_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "permissive",
+                    "broad_read_byte_threshold": 12_000,
+                }
+            },
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("vesta_runtime.get_current_run", return_value=object()):
+            assert tol.get_terminal_max_bytes() == 75_000
+
+    def test_terminal_tool_adds_vesta_truncation_metadata(self, tmp_path, monkeypatch):
+        from tools.terminal_tool import terminal_tool
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        set_current_run(None)
+        create_run(
+            session_id="session_terminal_limit",
+            workspace_path=tmp_path,
+            run_id="run_terminal_limit",
+        )
+        cfg = {
+            "tool_output": {"max_bytes": 50_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 12_000,
+                }
+            },
+        }
+        command = f"{shlex.quote(sys.executable)} -c \"print('x' * 30000)\""
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                result = json.loads(terminal_tool(command=command, timeout=10))
+        finally:
+            set_current_run(None)
+
+        assert result["exit_code"] == 0
+        assert result["truncated"] is True
+        assert result["original_chars"] >= 30_000
+        assert result["max_chars"] == 12_000
+        assert result["omitted_chars"] > 0
+        assert "Vesta disciplined retrieval cap" in result["repair_hint"]
+
+    def test_terminal_tool_non_vesta_truncation_keeps_legacy_shape(self, tmp_path, monkeypatch):
+        from tools.terminal_tool import terminal_tool
+        from vesta_runtime import set_current_run
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        set_current_run(None)
+        cfg = {"tool_output": {"max_bytes": 1000}}
+        command = f"{shlex.quote(sys.executable)} -c \"print('x' * 3000)\""
+
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            result = json.loads(terminal_tool(command=command, timeout=10))
+
+        assert result["exit_code"] == 0
+        assert "OUTPUT TRUNCATED" in result["output"]
+        assert "truncated" not in result
+        assert "repair_hint" not in result
+
+    def test_terminal_tool_vesta_large_output_budget_blocks_repeated_chunks(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from tools.terminal_tool import terminal_tool
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        set_current_run(None)
+        create_run(
+            session_id="session_terminal_budget",
+            workspace_path=tmp_path,
+            run_id="run_terminal_budget",
+            context_length=65_536,
+        )
+        cfg = {
+            "tool_output": {"max_bytes": 50_000},
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 20_000,
+                }
+            },
+        }
+        command = f"{shlex.quote(sys.executable)} -c \"print('x' * 30000)\""
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                results = [
+                    json.loads(
+                        terminal_tool(
+                            command=command,
+                            timeout=10,
+                            task_id="terminal_budget_test",
+                        )
+                    )
+                    for _ in range(5)
+                ]
+        finally:
+            set_current_run(None)
+
+        assert results[0]["truncated"] is True
+        assert results[0]["max_chars"] == 8192
+        assert results[-1]["repeat_truncation_limit_exceeded"] is True
+        assert results[-1]["output"] == ""
+        assert "already received several large terminal evidence payloads" in results[-1]["repair_hint"]
+
+    def test_terminal_tool_vesta_checkpoint_pressure_blocks_output(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from tools.terminal_tool import terminal_tool
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        set_current_run(None)
+        tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+        create_run(
+            session_id="session_terminal_checkpoint_pressure",
+            workspace_path=tmp_path,
+            run_id="run_terminal_checkpoint_pressure",
+        )
+        cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+        command = f"{shlex.quote(sys.executable)} -c \"print('small payload')\""
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT):
+                    assert tol.vesta_evidence_checkpoint_notice("read_file") is None
+                result = json.loads(terminal_tool(command=command, timeout=10))
+        finally:
+            set_current_run(None)
+
+        assert result["vesta_checkpoint_required"] is True
+        assert result["source"] == "terminal"
+        assert result["output"] == ""
+        assert "compact artifact checkpoint" in result["repair_hint"]
+
 
 class TestDefaultConfigHasSection:
     """The DEFAULT_CONFIG in hermes_cli.config must expose tool_output so
@@ -129,6 +334,38 @@ class TestDefaultConfigHasSection:
         assert section["max_bytes"] == tol.DEFAULT_MAX_BYTES
         assert section["max_lines"] == tol.DEFAULT_MAX_LINES
         assert section["max_line_length"] == tol.DEFAULT_MAX_LINE_LENGTH
+
+
+class TestVestaCheckpointPressure:
+    def test_checkpoint_notice_after_many_evidence_calls_until_artifact_checkpoint(self, tmp_path):
+        manifest_path = tmp_path / "artifact-manifest.md"
+        manifest_path.write_text("# Artifact Manifest\n", encoding="utf-8")
+        run = SimpleNamespace(run_dir=tmp_path / "run", artifact_manifest_path=manifest_path)
+        cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+        tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+
+        with patch("vesta_runtime.get_current_run", return_value=run), \
+             patch("hermes_cli.config.load_config", return_value=cfg):
+            notices = [
+                tol.vesta_evidence_checkpoint_notice("terminal")
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT)
+            ]
+            notice = tol.vesta_evidence_checkpoint_notice("terminal")
+
+        assert all(item is None for item in notices)
+        assert notice["vesta_checkpoint_required"] is True
+        assert notice["source"] == "terminal"
+        assert notice["evidence_calls_since_checkpoint"] == tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT + 1
+        assert "compact artifact checkpoint" in notice["repair_hint"]
+
+        manifest_path.write_text(
+            "# Artifact Manifest\n\nExpected By: `research_artifact_section_write`\n",
+            encoding="utf-8",
+        )
+        with patch("vesta_runtime.get_current_run", return_value=run), \
+             patch("hermes_cli.config.load_config", return_value=cfg):
+            assert tol.vesta_evidence_checkpoint_notice("read_file") is None
+        assert tol._VESTA_EVIDENCE_COUNT_BY_RUN == {}
 
 
 class TestIntegrationReadPagination:

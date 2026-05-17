@@ -887,6 +887,24 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     return "{}"
 
 
+_EMPTY_ARG_REPAIR_SAFE_TO_EXECUTE_TOOLS = {
+    "research_artifact_section_write",
+    "write_file",
+}
+
+
+def _empty_arg_repair_is_safe_to_execute(tool_name: str) -> bool:
+    """Return whether an unrepairable tool call can safely reach its handler.
+
+    Some handlers, notably ``write_file``, validate required arguments before
+    side effects and return a much better repair hint than the generic
+    truncation retry path. Keep this list conservative: only include tools
+    whose empty-argument handler is known to be side-effect free.
+    """
+
+    return tool_name in _EMPTY_ARG_REPAIR_SAFE_TO_EXECUTE_TOOLS
+
+
 def _strip_non_ascii(text: str) -> str:
     """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
 
@@ -2237,8 +2255,13 @@ class AIAgent:
         # compression model context-length detection needs the same list).
         self._custom_providers = _custom_providers
 
-        # Check custom_providers per-model context_length
-        if _config_context_length is None and _custom_providers:
+        # Check custom_providers per-model context_length.  When a CLI/model
+        # override selects a different model from the top-level default, the
+        # top-level ``model.context_length`` may be too large for the selected
+        # custom-provider model.  Prefer the narrower per-model value when it
+        # exists so compression/tooling respect the actual endpoint window.
+        _cp_ctx_resolved = None
+        if _custom_providers:
             try:
                 from hermes_cli.config import get_custom_provider_context_length
                 _cp_ctx_resolved = get_custom_provider_context_length(
@@ -2247,7 +2270,12 @@ class AIAgent:
                     custom_providers=_custom_providers,
                 )
                 if _cp_ctx_resolved:
-                    _config_context_length = int(_cp_ctx_resolved)
+                    _cp_ctx_int = int(_cp_ctx_resolved)
+                    if (
+                        _config_context_length is None
+                        or _cp_ctx_int < int(_config_context_length)
+                    ):
+                        _config_context_length = _cp_ctx_int
             except Exception:
                 _cp_ctx_resolved = None
 
@@ -2576,6 +2604,23 @@ class AIAgent:
         try:
             from vesta_runtime import create_run as _vesta_create_run
 
+            context_length = getattr(self.context_compressor, "context_length", None)
+            try:
+                from hermes_cli.config import get_custom_provider_context_length
+
+                provider_context_length = get_custom_provider_context_length(
+                    model=self.model or "",
+                    base_url=self.base_url or "",
+                    custom_providers=getattr(self, "_custom_providers", None),
+                )
+                if provider_context_length:
+                    context_length = (
+                        min(int(context_length), int(provider_context_length))
+                        if context_length
+                        else int(provider_context_length)
+                    )
+            except Exception:
+                pass
             self.vesta_run = _vesta_create_run(
                 session_id=self.session_id,
                 parent_session_id=self._parent_session_id,
@@ -2584,6 +2629,7 @@ class AIAgent:
                 model=self.model or "",
                 provider=self.provider or "",
                 platform=self.platform or "cli",
+                context_length=context_length,
             )
         except Exception as _vesta_err:
             self.vesta_run = None
@@ -6258,6 +6304,30 @@ class AIAgent:
             if closure_contract:
                 stable_parts.append(closure_contract)
 
+        vesta_state_tools = {
+            "ledger_append", "run_status", "finalize_run",
+            "worker_state_record", "validator_result_record",
+            "research_artifact_section_write",
+        }
+        external_evidence_tools = {
+            "terminal", "web_search", "web_extract", "browser_navigate",
+            "browser_snapshot", "browser_extract", "browser_vision",
+        }
+        if (
+            vesta_state_tools.intersection(self.valid_tool_names)
+            and external_evidence_tools.intersection(self.valid_tool_names)
+        ):
+            try:
+                from vesta_runtime.external_evidence import (
+                    build_external_evidence_prompt_contract,
+                )
+
+                external_evidence_contract = build_external_evidence_prompt_contract()
+            except Exception:
+                external_evidence_contract = ""
+            if external_evidence_contract:
+                stable_parts.append(external_evidence_contract)
+
         # Computer-use (macOS) — goes in as its own block rather than being
         # merged into tool_guidance because the content is multi-paragraph.
         if "computer_use" in self.valid_tool_names:
@@ -8569,6 +8639,11 @@ class AIAgent:
                             repaired = _repair_tool_call_arguments(arguments, tool_name)
                             if repaired != "{}":
                                 # Successfully repaired — use the fixed args
+                                arguments = repaired
+                            elif _empty_arg_repair_is_safe_to_execute(tool_name):
+                                # Let validation-first handlers return their
+                                # own actionable repair hint instead of burning
+                                # a truncation retry and hiding the tool error.
                                 arguments = repaired
                             else:
                                 # Unrepairable — flag for truncation handling
@@ -12040,6 +12115,21 @@ class AIAgent:
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
+        try:
+            from vesta_runtime import eval_mode_enabled as _vesta_eval_mode_enabled
+
+            if _vesta_eval_mode_enabled():
+                final_response = (
+                    f"Reached maximum iterations ({self.max_iterations}) before the "
+                    "Vesta eval contract was fully satisfied. Treat this eval run as "
+                    "incomplete and rely on typed Vesta state for the authoritative "
+                    "status."
+                )
+                print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Ending Vesta eval without summary call.")
+                messages.append({"role": "assistant", "content": final_response})
+                return final_response
+        except Exception:
+            pass
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
 
         summary_request = (

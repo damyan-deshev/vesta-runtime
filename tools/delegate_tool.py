@@ -938,6 +938,7 @@ def _toolsets_include_external_evidence_tools(toolsets: List[str]) -> bool:
         "web_extract",
         "browser_navigate",
         "browser_snapshot",
+        "browser_extract",
         "terminal",
         "execute_code",
     }
@@ -2379,6 +2380,23 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    try:
+        from vesta_runtime import validate_delegate_task_against_eval_contract
+
+        contract_failures = validate_delegate_task_against_eval_contract(
+            {"tasks": task_list}
+        )
+    except Exception:
+        logger.debug("Vesta delegate contract pre-spawn guard failed open", exc_info=True)
+        contract_failures = []
+    if contract_failures:
+        return tool_error(
+            "Vesta eval delegate contract mismatch: " + " ".join(contract_failures),
+            success=False,
+            code="vesta_delegate_contract_mismatch",
+            failures=contract_failures,
+        )
 
     invocation_id = uuid.uuid4().hex[:8]
     for i, task in enumerate(task_list):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -265,6 +266,55 @@ def test_sync_url_expansion_uses_async_fetcher(sample_repo: Path):
 
     assert result.expanded
     assert "Content for https://example.com/spec" in result.message
+
+
+@pytest.mark.asyncio
+async def test_default_url_fetcher_reads_current_web_extract_results_shape(monkeypatch):
+    from agent.context_references import _default_url_fetcher
+
+    async def fake_web_extract(urls, format=None, use_llm_processing=True):
+        assert urls == ["https://example.com/spec"]
+        assert format == "markdown"
+        assert use_llm_processing is True
+        return json.dumps(
+            {
+                "content_format": "normalized_markdown_text_evidence_not_dom",
+                "results": [
+                    {
+                        "url": "https://example.com/spec",
+                        "title": "Spec",
+                        "content": "# Spec\n\nImportant details.",
+                        "error": None,
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr("tools.web_tools.web_extract_tool", fake_web_extract)
+
+    assert await _default_url_fetcher("https://example.com/spec") == "# Spec\n\nImportant details."
+
+
+@pytest.mark.asyncio
+async def test_default_url_fetcher_keeps_legacy_documents_shape(monkeypatch):
+    from agent.context_references import _default_url_fetcher
+
+    async def fake_web_extract(urls, format=None, use_llm_processing=True):
+        return json.dumps(
+            {
+                "data": {
+                    "documents": [
+                        {
+                            "content": "Legacy document content",
+                        }
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr("tools.web_tools.web_extract_tool", fake_web_extract)
+
+    assert await _default_url_fetcher("https://example.com/spec") == "Legacy document content"
 
 
 def test_restricts_paths_to_allowed_root(tmp_path: Path):

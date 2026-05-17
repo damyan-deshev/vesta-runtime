@@ -20,6 +20,7 @@ from .state import (
     write_finalization,
     write_handoff,
     _ledger_entry_summaries,
+    _artifact_blocks,
     _latest_artifact_blocks,
     _finalization_status,
 )
@@ -145,9 +146,17 @@ def _infer_contract_profile(prompt_text: str) -> str:
     if cfg_profile and str(cfg_profile).strip() != "artifact_positive":
         return _coerce_contract_profile(cfg_profile)
     lowered = (prompt_text or "").lower()
-    if "research_ledger" in lowered or (
-        "research workflow" in lowered and "ledger" in lowered
-    ) or "evidence ledger" in lowered or "local research task" in lowered:
+    if (
+        "research_ledger" in lowered
+        or "research workflow" in lowered
+        or "evidence workflow" in lowered
+        or "current-world evidence" in lowered
+        or "source-backed artifact" in lowered
+        or "expected parent research artifact" in lowered
+        or "expected parent artifact" in lowered
+        or "evidence ledger" in lowered
+        or "local research task" in lowered
+    ):
         return "research_ledger"
     if "negative_tool_simulation" in lowered or (
         "negative" in lowered and ("fake" in lowered or "violate" in lowered)
@@ -168,13 +177,75 @@ def _extract_expected_artifact_path(prompt: str) -> str:
     return candidates[0]
 
 
+def _extract_required_delegate_worker_id(prompt: str) -> str:
+    patterns = (
+        r"[`'\"]?worker_id[`'\"]?\s*[:=]\s*[`'\"]?([A-Za-z0-9_.-]+)[`'\"]?",
+        r"\bworker\s+id\s+(?:is|must be|should be)\s*[`'\"]?([A-Za-z0-9_.-]+)[`'\"]?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, prompt or "", re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def _extract_required_delegate_artifact_path(prompt: str, expected_artifact: str) -> str:
+    candidates = _ABS_MD_PATH_RE.findall(prompt or "")
+    if not candidates:
+        return ""
+    expected = expected_artifact.strip()
+    for candidate in candidates:
+        if candidate == expected:
+            continue
+        idx = (prompt or "").find(candidate)
+        window = (prompt or "")[max(0, idx - 180): idx + len(candidate) + 180].lower()
+        if "validator" in window or "worker" in window or "delegate" in window:
+            return candidate
+    for candidate in candidates:
+        if candidate != expected:
+            return candidate
+    return ""
+
+
+def _has_eval_contract_marker(prompt: str) -> bool:
+    text = prompt or ""
+    lowered = text.lower()
+    if "artifact_record" in text and "finalize_run" in text:
+        return True
+    has_expected_artifact = any(
+        marker in lowered
+        for marker in (
+            "expected parent research artifact",
+            "expected parent artifact",
+            "expected research artifact",
+            "expected artifact",
+        )
+    )
+    has_vesta_context = "vesta eval mode" in lowered or "vesta" in lowered
+    has_completion_contract = any(
+        marker in lowered
+        for marker in (
+            "finalize the run",
+            "finalise the run",
+            "write a control-plane snapshot",
+            "success criteria",
+        )
+    )
+    return has_expected_artifact and has_vesta_context and has_completion_contract
+
+
 def _contract_path() -> Path:
     return ensure_current_run().run_dir / "eval-contract.md"
 
 
 def _read_contract_metadata() -> dict[str, str]:
     path = _contract_path()
-    metadata = {"expected_artifact": "", "contract_profile": "artifact_positive"}
+    metadata = {
+        "expected_artifact": "",
+        "contract_profile": "artifact_positive",
+        "required_delegate_worker_id": "",
+        "required_delegate_artifact": "",
+    }
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -186,6 +257,14 @@ def _read_contract_metadata() -> dict[str, str]:
             metadata["contract_profile"] = _coerce_contract_profile(
                 line[len("- Contract Profile: `"):-1]
             )
+        elif line.startswith("- Required Delegate Worker ID: `") and line.endswith("`"):
+            metadata["required_delegate_worker_id"] = line[
+                len("- Required Delegate Worker ID: `"):-1
+            ]
+        elif line.startswith("- Required Delegate Artifact: `") and line.endswith("`"):
+            metadata["required_delegate_artifact"] = line[
+                len("- Required Delegate Artifact: `"):-1
+            ]
     return metadata
 
 
@@ -199,25 +278,50 @@ def seed_eval_contract_from_prompt(
     if not eval_mode_enabled():
         return {"seeded": False, "reason": "eval_mode_disabled"}
     prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt, ensure_ascii=False)
-    if "artifact_record" not in prompt_text or "finalize_run" not in prompt_text:
-        return {"seeded": False, "reason": "no_vesta_contract_marker"}
     expected_artifact = _extract_expected_artifact_path(prompt_text)
     if not expected_artifact:
         return {"seeded": False, "reason": "no_expected_artifact_path"}
+    if not _has_eval_contract_marker(prompt_text):
+        return {"seeded": False, "reason": "no_vesta_contract_marker"}
     contract_profile = _infer_contract_profile(prompt_text)
+    required_delegate_worker_id = _extract_required_delegate_worker_id(prompt_text)
+    required_delegate_artifact = _extract_required_delegate_artifact_path(
+        prompt_text,
+        expected_artifact,
+    )
 
     run = ensure_current_run(session_id=session_id)
     contract_path = run.run_dir / "eval-contract.md"
+    required_delegate_worker_line = (
+        f"- Required Delegate Worker ID: `{required_delegate_worker_id}`\n"
+        if required_delegate_worker_id
+        else ""
+    )
+    required_delegate_artifact_line = (
+        f"- Required Delegate Artifact: `{required_delegate_artifact}`\n"
+        if required_delegate_artifact
+        else ""
+    )
     if (
         contract_path.exists()
         and expected_artifact in contract_path.read_text(encoding="utf-8")
         and f"- Contract Profile: `{contract_profile}`" in contract_path.read_text(encoding="utf-8")
+        and (
+            not required_delegate_worker_id
+            or required_delegate_worker_line in contract_path.read_text(encoding="utf-8")
+        )
+        and (
+            not required_delegate_artifact
+            or required_delegate_artifact_line in contract_path.read_text(encoding="utf-8")
+        )
     ):
         return {
             "seeded": False,
             "reason": "already_seeded",
             "expected_artifact": expected_artifact,
             "contract_profile": contract_profile,
+            "required_delegate_worker_id": required_delegate_worker_id,
+            "required_delegate_artifact": required_delegate_artifact,
             "contract_path": str(contract_path),
         }
 
@@ -227,6 +331,8 @@ def seed_eval_contract_from_prompt(
         f"Run ID: `{run.run_id}`\n"
         f"- Expected Artifact: `{expected_artifact}`\n"
         f"- Contract Profile: `{contract_profile}`\n"
+        f"{required_delegate_worker_line}"
+        f"{required_delegate_artifact_line}"
         "- Required Tool Order:\n"
         + "".join(f"  - `{item}`\n" for item in required_order)
         + "- State Simulation: `non_compliant`\n"
@@ -253,6 +359,8 @@ def seed_eval_contract_from_prompt(
         structured_payload={
             "expected_artifact": expected_artifact,
             "contract_profile": contract_profile,
+            "required_delegate_worker_id": required_delegate_worker_id,
+            "required_delegate_artifact": required_delegate_artifact,
             "required_tool_order": list(required_order),
         },
     )
@@ -260,6 +368,8 @@ def seed_eval_contract_from_prompt(
         "seeded": True,
         "expected_artifact": expected_artifact,
         "contract_profile": contract_profile,
+        "required_delegate_worker_id": required_delegate_worker_id,
+        "required_delegate_artifact": required_delegate_artifact,
         "contract_path": str(contract_path),
     }
 
@@ -322,6 +432,104 @@ def _delegate_payloads(args: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]
     return [("top_level", args)]
 
 
+def _string_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_string_values(item))
+        return values
+    return [str(value)] if str(value).strip() else []
+
+
+def _delegate_artifact_paths(payload: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    for key in ("expected_artifact_paths", "expected_artifact_path"):
+        paths.extend(_string_values(payload.get(key)))
+    output_contract = payload.get("output_contract")
+    if isinstance(output_contract, dict):
+        for key in (
+            "expected_artifact",
+            "expected_artifacts",
+            "expected_artifact_path",
+            "expected_artifact_paths",
+            "artifact_path",
+            "artifact_paths",
+        ):
+            paths.extend(_string_values(output_contract.get(key)))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in paths:
+        if path not in seen:
+            unique.append(path)
+            seen.add(path)
+    return unique
+
+
+def _path_matches_required(candidate: str, required: str) -> bool:
+    if candidate == required:
+        return True
+    try:
+        return str(Path(candidate).expanduser().resolve(strict=False)) == str(
+            Path(required).expanduser().resolve(strict=False)
+        )
+    except Exception:
+        return False
+
+
+def _payload_has_required_artifact(payload: dict[str, Any], required: str) -> bool:
+    return any(
+        _path_matches_required(candidate, required)
+        for candidate in _delegate_artifact_paths(payload)
+    )
+
+
+def validate_delegate_task_against_eval_contract(args: dict[str, Any]) -> list[str]:
+    """Return pre-spawn delegate contract failures for the active eval run."""
+
+    if not eval_mode_enabled():
+        return []
+    contract = _read_contract_metadata()
+    required_worker_id = contract.get("required_delegate_worker_id", "").strip()
+    required_artifact = contract.get("required_delegate_artifact", "").strip()
+    if not required_worker_id and not required_artifact:
+        return []
+
+    payloads = _delegate_payloads(args)
+    matching_payloads = [
+        (label, payload)
+        for label, payload in payloads
+        if not required_worker_id
+        or str(payload.get("worker_id") or "").strip() == required_worker_id
+    ]
+    failures: list[str] = []
+    if required_worker_id and not matching_payloads:
+        observed = [
+            str(payload.get("worker_id") or label).strip()
+            for label, payload in payloads
+        ]
+        failures.append(
+            "Eval contract requires delegate worker_id "
+            f"`{required_worker_id}`, but delegate_task provided "
+            f"{', '.join(observed) if observed else 'none'}."
+        )
+        return failures
+
+    if required_artifact and not any(
+        _payload_has_required_artifact(payload, required_artifact)
+        for _, payload in matching_payloads
+    ):
+        failures.append(
+            "Eval contract requires delegate artifact "
+            f"`{required_artifact}` in expected_artifact_paths or output_contract "
+            f"for worker `{required_worker_id or 'any'}`."
+        )
+    return failures
+
+
 def _delegate_requires_output_contract(payload: dict[str, Any]) -> bool:
     return bool(
         str(payload.get("worker_id") or "").strip()
@@ -374,21 +582,44 @@ def _label_index(labels: list[str], label: str) -> int:
         return -1
 
 
+def _first_label_index(labels: list[str], *candidates: str) -> int:
+    indexes = [
+        index
+        for candidate in candidates
+        if (index := _label_index(labels, candidate)) >= 0
+    ]
+    return min(indexes) if indexes else -1
+
+
 def _research_ledger_failures(run, events: list[dict[str, Any]]) -> list[str]:
     labels = [event["label"] for event in events]
     failures: list[str] = []
-    if "artifact_record:expected" not in labels:
+    artifact_blocks = _artifact_blocks(run)
+    latest_artifacts = _latest_artifact_blocks(run)
+    has_expected_artifact_state = any(
+        artifact.get("status") == "expected"
+        or artifact.get("requested_status") == "expected"
+        for artifact in artifact_blocks
+    )
+    has_existing_artifact_state = any(
+        artifact.get("status") == "exists"
+        for artifact in latest_artifacts
+    )
+    if "artifact_record:expected" not in labels and not has_expected_artifact_state:
         failures.append("Research eval did not record the expected artifact.")
-    if "artifact_record:exists" not in labels:
+    if "artifact_record:exists" not in labels and not has_existing_artifact_state:
         failures.append("Research eval did not record a verified final artifact.")
     if "finalize_run" not in labels:
         failures.append("Research eval did not finalize the run.")
-    exists_idx = _label_index(labels, "artifact_record:exists")
+    exists_idx = _first_label_index(
+        labels,
+        "artifact_record:exists",
+        "research_artifact_section_write",
+    )
     finalize_idx = _label_index(labels, "finalize_run")
     if exists_idx >= 0 and finalize_idx >= 0 and finalize_idx < exists_idx:
         failures.append("Research eval finalized before the artifact was recorded as existing.")
-    latest_artifacts = _latest_artifact_blocks(run)
-    if not any(artifact.get("status") == "exists" for artifact in latest_artifacts):
+    if not has_existing_artifact_state:
         failures.append("Research eval has no latest artifact state with status `exists`.")
     ledger_entries = _ledger_entry_summaries(run)
     material_entries = [

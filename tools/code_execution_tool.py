@@ -73,6 +73,92 @@ DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
+
+def _get_execute_output_limit_info() -> Dict[str, Any]:
+    try:
+        from tools.tool_output_limits import get_vesta_retrieval_output_limit_info
+
+        return get_vesta_retrieval_output_limit_info(
+            MAX_STDOUT_BYTES,
+            source="execute_code",
+        )
+    except Exception:
+        return {
+            "max_bytes": MAX_STDOUT_BYTES,
+            "source": "execute_code",
+            "vesta_active": False,
+            "disciplined": False,
+        }
+
+
+def _truncate_execute_output(text: str, max_chars: int) -> tuple[str, int]:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value, 0
+    if max_chars <= 0:
+        return "", len(value)
+
+    original_chars = len(value)
+    notice = (
+        f"\n\n... [VESTA OUTPUT TRUNCATED - {original_chars - max_chars:,} "
+        f"chars omitted out of {original_chars:,} total] ...\n\n"
+    )
+    budget = max(0, max_chars - len(notice))
+    head_chars = int(budget * 0.4)
+    tail_chars = budget - head_chars
+    head = value[:head_chars]
+    tail = value[-tail_chars:] if tail_chars > 0 else ""
+    omitted = original_chars - len(head) - len(tail)
+    notice = (
+        f"\n\n... [VESTA OUTPUT TRUNCATED - {omitted:,} chars omitted "
+        f"out of {original_chars:,} total] ...\n\n"
+    )
+    return head + notice + tail, omitted
+
+
+def _apply_execute_output_budget(result: Dict[str, Any]) -> Dict[str, Any]:
+    limit_info = _get_execute_output_limit_info()
+    if not (limit_info.get("vesta_active") and limit_info.get("disciplined")):
+        return result
+
+    output = str(result.get("output") or "")
+    max_chars = int(limit_info.get("max_bytes") or MAX_STDOUT_BYTES)
+    truncated, omitted = _truncate_execute_output(output, max_chars)
+    if omitted > 0:
+        result["output"] = truncated
+        result.update({
+            "truncated": True,
+            "original_chars": len(output),
+            "max_chars": max_chars,
+            "omitted_chars": omitted,
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            "repair_hint": (
+                "execute_code returned bounded output for this Vesta run. "
+                "Filter or summarize data inside the script, write compact artifacts, "
+                "or use targeted follow-up reads instead of printing broad payloads."
+            ),
+        })
+
+    try:
+        from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+        checkpoint_notice = vesta_evidence_checkpoint_notice("execute_code")
+    except Exception:
+        checkpoint_notice = None
+    if checkpoint_notice:
+        result["output"] = ""
+        result.update({
+            "truncated": True,
+            "original_chars": len(output),
+            "max_chars": max_chars,
+            "omitted_chars": len(output),
+            "max_chars_source": limit_info.get("source"),
+            "context_length_tokens": limit_info.get("context_length_tokens"),
+            **checkpoint_notice,
+        })
+    return result
+
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
 # match either a safe prefix or, on Windows, an OS-essential name.
@@ -1026,6 +1112,7 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
+    result = _apply_execute_output_budget(result)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1412,6 +1499,7 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
+        result = _apply_execute_output_budget(result)
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:

@@ -67,6 +67,173 @@ class TestReadFileHandler:
         assert "error" in result
         assert "terminal not available" in result["error"]
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_vesta_read_file_truncates_to_context_aware_window(
+        self,
+        mock_get,
+        tmp_path,
+        monkeypatch,
+    ):
+        from tools.file_tools import read_file_tool
+        from vesta_runtime import create_run, set_current_run
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        content = "1| " + ("x" * 20_000)
+        result_obj.content = content
+        result_obj.to_dict.return_value = {
+            "content": content,
+            "total_lines": 200,
+            "file_size": 20_000,
+            "truncated": False,
+        }
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+        cfg = {
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 20_000,
+                }
+            }
+        }
+
+        set_current_run(None)
+        create_run(
+            session_id="session_read_context_cap",
+            workspace_path=tmp_path,
+            run_id="run_read_context_cap",
+            context_length=65_536,
+        )
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                result = json.loads(
+                    read_file_tool(
+                        str(tmp_path / "paper.md"),
+                        limit=1000,
+                        complete_coverage=True,
+                        task_id="read_context_cap",
+                    )
+                )
+        finally:
+            set_current_run(None)
+
+        assert result["truncated"] is True
+        assert result["original_chars"] == len(content)
+        assert result["max_chars"] == 8192
+        assert result["max_chars_source"] == "vesta_context_retrieval"
+        assert result["context_length_tokens"] == 65_536
+        assert "READ_FILE OUTPUT TRUNCATED" in result["content"]
+        assert "bounded Vesta evidence window" in result["repair_hint"]
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_vesta_read_file_large_window_budget_blocks_repeated_chunks(
+        self,
+        mock_get,
+        tmp_path,
+    ):
+        from tools.file_tools import read_file_tool
+        from vesta_runtime import create_run, set_current_run
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        content = "1| " + ("x" * 20_000)
+        result_obj.content = content
+        result_obj.to_dict.return_value = {
+            "content": content,
+            "total_lines": 200,
+            "file_size": 20_000,
+            "truncated": False,
+        }
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+        cfg = {
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 20_000,
+                }
+            }
+        }
+
+        set_current_run(None)
+        create_run(
+            session_id="session_read_budget",
+            workspace_path=tmp_path,
+            run_id="run_read_budget",
+            context_length=65_536,
+        )
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                results = [
+                    json.loads(
+                        read_file_tool(
+                            str(tmp_path / f"paper-{idx}.md"),
+                            limit=1000,
+                            complete_coverage=True,
+                            task_id="read_budget_test",
+                        )
+                    )
+                    for idx in range(5)
+                ]
+        finally:
+            set_current_run(None)
+
+        assert results[0]["truncated"] is True
+        assert results[0]["max_chars"] == 8192
+        assert results[-1]["repeat_truncation_limit_exceeded"] is True
+        assert results[-1]["content"] == ""
+        assert "already received several large read_file evidence windows" in results[-1]["repair_hint"]
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_vesta_checkpoint_pressure_blocks_read_file_content(
+        self,
+        mock_get,
+        tmp_path,
+    ):
+        from tools import tool_output_limits as tol
+        from tools.file_tools import read_file_tool
+        from vesta_runtime import create_run, set_current_run
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = "small evidence"
+        result_obj.to_dict.return_value = {
+            "content": "small evidence",
+            "total_lines": 1,
+            "file_size": 14,
+            "truncated": False,
+        }
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+        cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+
+        set_current_run(None)
+        tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+        create_run(
+            session_id="session_read_checkpoint_pressure",
+            workspace_path=tmp_path,
+            run_id="run_read_checkpoint_pressure",
+        )
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg):
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT):
+                    assert tol.vesta_evidence_checkpoint_notice("terminal") is None
+                result = json.loads(
+                    read_file_tool(
+                        str(tmp_path / "source.md"),
+                        task_id="read_checkpoint_pressure",
+                    )
+                )
+        finally:
+            set_current_run(None)
+
+        assert result["vesta_checkpoint_required"] is True
+        assert result["source"] == "read_file"
+        assert result["content"] == ""
+        assert result["omitted_chars"] == len("small evidence")
+        assert "compact artifact checkpoint" in result["repair_hint"]
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
@@ -120,6 +287,27 @@ class TestWriteFileHandler:
         result = json.loads(_handle_write_file({"content": "hello"}))
         assert "error" in result
 
+    def test_vesta_eval_missing_write_file_args_hints_section_writer(self, tmp_path, monkeypatch):
+        from tools.file_tools import _handle_write_file
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        set_current_run(None)
+        create_run(
+            session_id="session_write_corrupt_args",
+            workspace_path=tmp_path,
+            run_id="run_write_corrupt_args",
+        )
+
+        try:
+            result = json.loads(_handle_write_file({}))
+        finally:
+            set_current_run(None)
+
+        assert result["success"] is False
+        assert result["code"] == "vesta_write_file_args_missing_or_corrupt"
+        assert "research_artifact_section_write" in result["repair_hint"]
+
     def test_explicit_empty_content_is_allowed(self):
         """#19096 — explicit empty string content (file truncation) must still work."""
         from tools.file_tools import _handle_write_file
@@ -141,6 +329,95 @@ class TestWriteFileHandler:
         result = json.loads(_handle_write_file({"path": "/tmp/x.txt", "content": {"nested": "dict"}}))
         assert "error" in result
         assert "string" in result["error"].lower() or "content" in result["error"].lower()
+
+    def test_vesta_eval_rejects_oversized_markdown_artifact_write(self, tmp_path, monkeypatch):
+        from tools.file_tools import _handle_write_file
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        set_current_run(None)
+        create_run(
+            session_id="session_write_guard",
+            workspace_path=tmp_path,
+            run_id="run_write_guard",
+        )
+        artifact = tmp_path / "live-eval-artifacts" / "report.md"
+        cfg = {
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 32,
+                }
+            }
+        }
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg), \
+                 patch("tools.file_tools._check_sensitive_path", return_value=None), \
+                 patch("tools.file_tools._get_file_ops") as mock_get:
+                result = json.loads(
+                    _handle_write_file(
+                        {"path": str(artifact), "content": "x" * 100},
+                        task_id="write_guard",
+                    )
+                )
+        finally:
+            set_current_run(None)
+
+        assert result["success"] is False
+        assert result["code"] == "vesta_artifact_write_too_large"
+        assert result["content_chars"] == 100
+        assert result["max_chars"] == 32
+        assert "compact evidence index" in result["repair_hint"]
+        mock_get.assert_not_called()
+
+    def test_vesta_eval_allows_small_markdown_artifact_write(self, tmp_path, monkeypatch):
+        from tools.file_tools import _handle_write_file
+        from vesta_runtime import create_run, set_current_run
+
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        set_current_run(None)
+        create_run(
+            session_id="session_write_guard_small",
+            workspace_path=tmp_path,
+            run_id="run_write_guard_small",
+        )
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+        artifact = "live-eval-artifacts/report.md"
+        cfg = {
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 32,
+                }
+            }
+        }
+
+        try:
+            with patch("hermes_cli.config.load_config", return_value=cfg), \
+                 patch("tools.file_tools._check_sensitive_path", return_value=None), \
+                 patch("tools.file_tools._get_file_ops") as mock_get:
+                mock_ops = MagicMock()
+                result_obj = MagicMock()
+                result_obj.to_dict.return_value = {
+                    "status": "ok",
+                    "path": artifact,
+                    "bytes": 5,
+                }
+                mock_ops.write_file.return_value = result_obj
+                mock_get.return_value = mock_ops
+
+                result = json.loads(
+                    _handle_write_file(
+                        {"path": str(artifact), "content": "small"},
+                        task_id="write_guard_small",
+                    )
+                )
+        finally:
+            set_current_run(None)
+
+        assert result["status"] == "ok"
+        mock_ops.write_file.assert_called_once_with(artifact, "small")
 
 
 class TestPatchHandler:
@@ -264,6 +541,73 @@ class TestSearchHandler:
         from tools.file_tools import search_tool
         result = json.loads(search_tool(pattern="x"))
         assert "error" in result
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_vesta_search_files_caps_large_result(self, mock_get):
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "total_count": 80,
+            "matches": [
+                {"path": f"paper-{idx}.md", "line": idx, "content": "x" * 200}
+                for idx in range(80)
+            ],
+        }
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+        cfg = {
+            "vesta": {
+                "retrieval": {
+                    "mode": "disciplined",
+                    "broad_read_byte_threshold": 1_000,
+                }
+            }
+        }
+
+        from tools.file_tools import search_tool
+        with patch("vesta_runtime.get_current_run", return_value=object()), \
+             patch("hermes_cli.config.load_config", return_value=cfg):
+            raw = search_tool(pattern="SenseNova", task_id="search_cap")
+        result = json.loads(raw.split("\n\n[Hint:", 1)[0])
+
+        assert result["truncated"] is True
+        assert result["max_chars"] == 1_000
+        assert result["max_chars_source"] == "vesta_retrieval"
+        assert result["returned_matches_count"] < 80
+        assert result["original_matches_count"] == 80
+        assert "output_mode='count'" in result["repair_hint"]
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_vesta_checkpoint_pressure_blocks_search_files_result(self, mock_get):
+        from tools import tool_output_limits as tol
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.to_dict.return_value = {
+            "total_count": 20,
+            "matches": [
+                {"path": f"paper-{idx}.md", "line": idx, "content": "x" * 100}
+                for idx in range(20)
+            ],
+        }
+        mock_ops.search.return_value = result_obj
+        mock_get.return_value = mock_ops
+        cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+        run = object()
+        tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+
+        from tools.file_tools import search_tool
+        with patch("vesta_runtime.get_current_run", return_value=run), \
+             patch("hermes_cli.config.load_config", return_value=cfg):
+            for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT):
+                assert tol.vesta_evidence_checkpoint_notice("read_file") is None
+            raw = search_tool(pattern="SenseNova", task_id="search_checkpoint")
+        result = json.loads(raw.split("\n\n[Hint:", 1)[0])
+
+        assert result["vesta_checkpoint_required"] is True
+        assert result["source"] == "search_files"
+        assert result["matches"] == []
+        assert "compact artifact checkpoint" in result["repair_hint"]
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import pytest
 
 import json
 import os
+import tempfile
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -34,6 +35,7 @@ import sys
 import time
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from tools.code_execution_tool import (
@@ -964,6 +966,67 @@ for i in range(15000):
         if "TRUNCATED" in output:
             self.assertIn("chars omitted", output)
             self.assertIn("total", output)
+
+    def test_vesta_disciplined_run_caps_execute_output_for_small_context(self):
+        """Active Vesta runs tighten execute_code output below generic 50 KB."""
+        code = '''
+print("HEAD_MARKER_START")
+print("x" * 20000)
+print("TAIL_MARKER_END")
+'''
+        with (
+            patch.dict(os.environ, {"VESTA_CONTEXT_LENGTH_TOKENS": "65536"}),
+            patch("vesta_runtime.get_current_run", return_value=object()),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "vesta": {
+                        "retrieval": {
+                            "mode": "disciplined",
+                            "broad_read_byte_threshold": 20_000,
+                        }
+                    }
+                },
+            ),
+        ):
+            result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["max_chars"], 8192)
+        self.assertEqual(result["max_chars_source"], "vesta_context_retrieval")
+        self.assertEqual(result["context_length_tokens"], 65536)
+        self.assertLessEqual(len(result["output"]), 8192)
+        self.assertIn("HEAD_MARKER_START", result["output"])
+        self.assertIn("TAIL_MARKER_END", result["output"])
+        self.assertIn("bounded output", result["repair_hint"])
+
+    def test_vesta_checkpoint_pressure_blocks_execute_output(self):
+        """execute_code participates in the generalized Vesta checkpoint guard."""
+        from tools import tool_output_limits as tol
+
+        code = 'print("small payload")'
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = os.path.join(tmp, "artifact-manifest.md")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write("# Artifact Manifest\n")
+            run = SimpleNamespace(run_dir=os.path.join(tmp, "run"), artifact_manifest_path=manifest_path)
+            cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+            tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+            with (
+                patch.dict(os.environ, {"VESTA_CONTEXT_LENGTH_TOKENS": "65536"}),
+                patch("vesta_runtime.get_current_run", return_value=run),
+                patch("hermes_cli.config.load_config", return_value=cfg),
+            ):
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT):
+                    self.assertIsNone(tol.vesta_evidence_checkpoint_notice("terminal"))
+                result = self._run(code)
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["vesta_checkpoint_required"])
+        self.assertEqual(result["source"], "execute_code")
+        self.assertEqual(result["output"], "")
+        self.assertIn("compact artifact checkpoint", result["repair_hint"])
 
 
 if __name__ == "__main__":

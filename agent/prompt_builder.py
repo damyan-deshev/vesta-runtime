@@ -1242,6 +1242,7 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         "browser_scroll",
         "browser_console",
         "browser_press",
+        "browser_extract",
         "browser_get_images",
         "browser_vision",
         "image_generate",

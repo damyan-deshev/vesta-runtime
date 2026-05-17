@@ -42,7 +42,7 @@ _HERMES_CORE_TOOLS = [
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_get_images",
+    "browser_press", "browser_extract", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
@@ -55,7 +55,7 @@ _HERMES_CORE_TOOLS = [
     "artifact_manifest_status", "run_status", "whole_document_read", "artifact_record",
     "worker_state_record", "coding_eval_start", "coding_eval_capture",
     "raw_ref_purge", "validator_result_record", "control_plane_snapshot",
-    "handoff_generate", "finalize_run",
+    "handoff_generate", "research_artifact_section_write", "finalize_run",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -168,7 +168,7 @@ TOOLSETS = {
         "tools": [
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_extract", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
             "browser_dialog", "web_search"
         ],
@@ -344,7 +344,7 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_extract", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
@@ -369,7 +369,7 @@ TOOLSETS = {
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_get_images",
+            "browser_press", "browser_extract", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             # Planning & memory
             "todo", "memory",

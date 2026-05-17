@@ -52,6 +52,44 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_custom_provider_model_context_narrows_top_level_context_override():
+    cfg = {
+        "model": {
+            "context_length": 196_608,
+        },
+        "custom_providers": [
+            {
+                "name": "local",
+                "base_url": "http://localhost:1234/v1",
+                "models": {
+                    "small-context-model": {
+                        "context_length": 65_536,
+                    },
+                },
+            }
+        ],
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            model="small-context-model",
+            provider="custom",
+            api_key="test",
+            base_url="http://localhost:1234/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+
+    assert agent._config_context_length == 65_536
+    assert agent.context_compressor.context_length == 65_536
+
+
 @pytest.fixture()
 def agent():
     """Minimal AIAgent with mocked OpenAI client and tool loading."""
@@ -1031,6 +1069,58 @@ class TestBuildSystemPrompt:
 
         assert "Vesta closure discipline" in prompt
         assert "verify material actions" in prompt
+
+    def test_includes_external_evidence_guidance_when_vesta_has_online_tools(self):
+        tools = _make_tool_defs("ledger_append", "run_status", "terminal", "browser_extract")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "vesta_runtime.external_evidence.build_external_evidence_prompt_contract",
+                return_value=(
+                    "External evidence discipline:\n"
+                    "- shortest evidence path\n"
+                    "- avoid large write_file or terminal heredoc payloads"
+                ),
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "External evidence discipline" in prompt
+        assert "shortest evidence path" in prompt
+        assert "avoid large write_file or terminal heredoc payloads" in prompt
+
+    def test_skips_external_evidence_guidance_without_vesta_tools(self):
+        tools = _make_tool_defs("terminal", "browser_extract")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "vesta_runtime.external_evidence.build_external_evidence_prompt_contract",
+                return_value="External evidence discipline:\n- should not appear",
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "should not appear" not in prompt
 
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
@@ -2372,6 +2462,20 @@ class TestMcpParallelToolBatch:
 
 
 class TestHandleMaxIterations:
+    def test_vesta_eval_returns_deterministic_failure_without_summary_call(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        agent._cached_system_prompt = "You are helpful."
+        agent.max_iterations = 32
+        messages = [{"role": "user", "content": "do stuff"}]
+
+        result = agent._handle_max_iterations(messages, 32)
+
+        assert "maximum iterations (32)" in result
+        assert "Vesta eval contract" in result
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"] == result
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp

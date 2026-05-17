@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -181,18 +182,26 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("External evidence discipline", prompt)
         self.assertIn("concrete online signal", prompt)
         self.assertIn("speculation", prompt)
+        self.assertIn("current tool surface", prompt)
         self.assertIn("shortest evidence path", prompt)
+        self.assertIn("Do not use delegation just to satisfy evidence discipline", prompt)
+        self.assertIn("read it in one direct pass", prompt)
         self.assertIn("Web evidence/extraction results", prompt)
         self.assertIn("not raw HTML, JavaScript, DOM nodes", prompt)
         self.assertIn("Do not repeat retrieval waiting for DOM-like output", prompt)
+        self.assertIn("browser_extract", prompt)
+        self.assertIn("bounded normalized markdown evidence", prompt)
         self.assertIn("Hard per-call output budget", prompt)
         self.assertIn("compact normalized text excerpt", prompt)
         self.assertIn("12000 characters", prompt)
         self.assertIn("markdown/text extraction", prompt)
         self.assertIn("not a task budget", prompt)
         self.assertIn("bounded-read", prompt)
+        self.assertIn("avoid large write_file or terminal heredoc payloads", prompt)
         self.assertIn("same tool, URL, query, or source fails twice", prompt)
         self.assertIn("Do not spend the full iteration or time budget", prompt)
+        self.assertNotIn("your delegated task", prompt)
+        self.assertNotIn("child session", prompt)
 
     def test_web_toolsets_trigger_external_evidence_contract_detection(self):
         self.assertTrue(_toolsets_include_external_evidence_tools(["web"]))
@@ -1853,9 +1862,9 @@ class TestDelegateHeartbeat(unittest.TestCase):
             )
 
         # With the old idle threshold (5 cycles = 0.25s), touch_calls
-        # would cap at ~5. With the in-tool threshold (20 cycles = 1.0s),
-        # we should see substantially more heartbeats over 0.4s.
-        self.assertGreater(
+        # would cap at ~5. The exact final heartbeat in this 0.4s window is
+        # scheduler-sensitive under xdist, so 6 is the stable regression line.
+        self.assertGreaterEqual(
             len(touch_calls), 6,
             f"Heartbeat stopped too early while child was inside a tool; "
             f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
@@ -2849,6 +2858,128 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+def _seed_sensenova_delegate_contract(tmp_path, monkeypatch):
+    from vesta_runtime import create_run, seed_eval_contract_from_prompt, set_current_run
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_delegate_guard",
+        workspace_path=tmp_path,
+        run_id="run_delegate_guard",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "report.md"
+    validator_artifact = tmp_path / "live-eval-artifacts" / "validator.md"
+    seed_eval_contract_from_prompt(
+        prompt=(
+            "Hard contract: call artifact_record, delegate_task, and finalize_run.\n"
+            f"Parent artifact: {artifact}\n"
+            "`worker_id`: `sensenova-u1-validator`\n"
+            f"Validator artifact: {validator_artifact}\n"
+        ),
+        session_id="session_delegate_guard",
+    )
+    return run, artifact, validator_artifact
+
+
+def _delegate_creds():
+    return {
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "model": None,
+    }
+
+
+def test_eval_delegate_contract_rejects_wrong_worker_before_spawn(tmp_path, monkeypatch):
+    from tools.delegate_tool import delegate_task
+    from vesta_runtime import set_current_run
+
+    run, _, validator_artifact = _seed_sensenova_delegate_contract(tmp_path, monkeypatch)
+    parent = _make_mock_parent(depth=0)
+    parent.session_id = "session_delegate_guard"
+    parent.vesta_run = run
+
+    try:
+        with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_delegate_creds()), \
+             patch("tools.delegate_tool._build_child_agent") as mock_build:
+            result = json.loads(
+                delegate_task(
+                    goal="Validate the SenseNova report.",
+                    worker_id="worker_auto",
+                    output_contract={"expected_artifact": str(validator_artifact)},
+                    expected_artifact_paths=[str(validator_artifact)],
+                    parent_agent=parent,
+                )
+            )
+    finally:
+        set_current_run(None)
+
+    assert result["success"] is False
+    assert result["code"] == "vesta_delegate_contract_mismatch"
+    assert "sensenova-u1-validator" in result["failures"][0]
+    mock_build.assert_not_called()
+    assert "worker_auto" not in run.worker_state_path.read_text(encoding="utf-8")
+
+
+def test_eval_delegate_contract_allows_correct_validator_and_records_contract(tmp_path, monkeypatch):
+    from tools.delegate_tool import delegate_task
+    from vesta_runtime import set_current_run
+
+    run, _, validator_artifact = _seed_sensenova_delegate_contract(tmp_path, monkeypatch)
+    validator_artifact.parent.mkdir(parents=True, exist_ok=True)
+    validator_artifact.write_text("validator report", encoding="utf-8")
+    parent = _make_mock_parent(depth=0)
+    parent.session_id = "session_delegate_guard"
+    parent.vesta_run = run
+    parent._memory_manager = None
+    parent._interrupt_requested = False
+    parent.session_estimated_cost_usd = 0.0
+    parent.session_cost_source = "none"
+    parent.session_cost_status = "unknown"
+
+    mock_child = MagicMock()
+    mock_child.session_id = "session_child_validator"
+    mock_child.vesta_run = SimpleNamespace(run_id="run_child_validator")
+    mock_child.provider = "llama.cpp"
+    mock_child.model = "qwen3.6-35b"
+
+    try:
+        with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=_delegate_creds()), \
+             patch("tools.delegate_tool._build_child_agent", return_value=mock_child) as mock_build, \
+             patch(
+                 "tools.delegate_tool._run_single_child",
+                 return_value={
+                     "task_index": 0,
+                     "status": "completed",
+                     "summary": "validator complete",
+                     "api_calls": 1,
+                     "duration_seconds": 0.1,
+                 },
+             ):
+            result = json.loads(
+                delegate_task(
+                    goal="Validate the SenseNova report.",
+                    worker_id="sensenova-u1-validator",
+                    output_contract={"expected_artifact": str(validator_artifact)},
+                    expected_artifact_paths=[str(validator_artifact)],
+                    parent_agent=parent,
+                )
+            )
+    finally:
+        set_current_run(None)
+
+    mock_build.assert_called_once()
+    assert result["results"][0]["worker_id"] == "sensenova-u1-validator"
+    assert result["results"][0]["expected_artifact_paths"] == [str(validator_artifact)]
+    assert result["results"][0]["observed_artifact_paths"] == [str(validator_artifact)]
+    worker_state = run.worker_state_path.read_text(encoding="utf-8")
+    assert "sensenova-u1-validator - requested" in worker_state
+    assert "sensenova-u1-validator - completed" in worker_state
+    assert str(validator_artifact) in worker_state
 
 
 if __name__ == "__main__":

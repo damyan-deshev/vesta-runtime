@@ -51,6 +51,18 @@ from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+_VESTA_TERMINAL_TRUNCATION_LIMIT = 4
+_vesta_terminal_truncation_lock = threading.Lock()
+_vesta_terminal_truncations_by_task: dict[str, int] = {}
+
+
+def _vesta_terminal_truncation_budget_exceeded(task_id: str | None) -> tuple[bool, int]:
+    key = task_id or "default"
+    with _vesta_terminal_truncation_lock:
+        count = _vesta_terminal_truncations_by_task.get(key, 0) + 1
+        _vesta_terminal_truncations_by_task[key] = count
+    return count > _VESTA_TERMINAL_TRUNCATION_LIMIT, count
+
 
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
@@ -2096,17 +2108,48 @@ def terminal_tool(
                 pass
             
             # Truncate output if too long, keeping both head and tail
-            from tools.tool_output_limits import get_max_bytes
-            MAX_OUTPUT_CHARS = get_max_bytes()
-            if len(output) > MAX_OUTPUT_CHARS:
+            from tools.tool_output_limits import get_terminal_output_limit_info
+            limit_info = get_terminal_output_limit_info()
+            MAX_OUTPUT_CHARS = int(limit_info["max_bytes"])
+            original_chars = len(output)
+            vesta_bounded = bool(limit_info.get("disciplined") and limit_info.get("vesta_active"))
+            truncated = original_chars > MAX_OUTPUT_CHARS
+            omitted = 0
+            if truncated:
                 head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
                 tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
-                omitted = len(output) - head_chars - tail_chars
+                omitted = original_chars - head_chars - tail_chars
                 truncated_notice = (
                     f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
+                    f"out of {original_chars} total] ...\n\n"
                 )
                 output = output[:head_chars] + truncated_notice + output[-tail_chars:]
+                if vesta_bounded:
+                    budget_exceeded, truncation_count = _vesta_terminal_truncation_budget_exceeded(
+                        effective_task_id,
+                    )
+                    if budget_exceeded:
+                        return json.dumps({
+                            "output": "",
+                            "exit_code": returncode,
+                            "error": None,
+                            "truncated": True,
+                            "original_chars": original_chars,
+                            "max_chars": MAX_OUTPUT_CHARS,
+                            "omitted_chars": original_chars,
+                            "max_chars_source": limit_info.get("source", "tool_output"),
+                            "context_length_tokens": limit_info.get("context_length_tokens"),
+                            "repeat_truncation_limit_exceeded": True,
+                            "truncation_count": truncation_count,
+                            "truncation_limit": _VESTA_TERMINAL_TRUNCATION_LIMIT,
+                            "repair_hint": (
+                                "This Vesta run has already received several large "
+                                "terminal evidence payloads. Stop broad terminal "
+                                "retrieval, write/checkpoint concise findings or gaps, "
+                                "then continue only with a targeted command that returns "
+                                "a smaller selected signal."
+                            ),
+                        }, ensure_ascii=False)
 
             # Strip ANSI escape sequences so the model never sees terminal
             # formatting — prevents it from copying escapes into file writes.
@@ -2126,6 +2169,45 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            if vesta_bounded:
+                result_dict.update(
+                    {
+                        "truncated": truncated,
+                        "original_chars": original_chars,
+                        "max_chars": MAX_OUTPUT_CHARS,
+                        "omitted_chars": omitted,
+                        "repair_hint": (
+                            "Output exceeded the Vesta disciplined retrieval cap. "
+                            "The effective cap may be tightened by the active model context. "
+                            "Re-run a narrower command using grep/rg context, "
+                            "head/sed windows, field selection, or checkpoint "
+                            "findings and request another targeted window."
+                            if truncated
+                            else ""
+                        ),
+                        "max_chars_source": limit_info.get("source", "tool_output"),
+                        "context_length_tokens": limit_info.get("context_length_tokens"),
+                    }
+                )
+                try:
+                    from tools.tool_output_limits import vesta_evidence_checkpoint_notice
+
+                    checkpoint_notice = vesta_evidence_checkpoint_notice("terminal")
+                except Exception:
+                    checkpoint_notice = None
+                if checkpoint_notice:
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": returncode,
+                        "error": None,
+                        "truncated": True,
+                        "original_chars": original_chars,
+                        "max_chars": MAX_OUTPUT_CHARS,
+                        "omitted_chars": original_chars,
+                        "max_chars_source": limit_info.get("source", "tool_output"),
+                        "context_length_tokens": limit_info.get("context_length_tokens"),
+                        **checkpoint_notice,
+                    }, ensure_ascii=False)
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:

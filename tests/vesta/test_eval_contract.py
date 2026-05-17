@@ -8,7 +8,9 @@ from vesta_runtime import (
     record_artifact,
     seed_eval_contract_from_prompt,
     set_current_run,
+    validate_delegate_task_against_eval_contract,
     write_finalization,
+    write_research_artifact_section,
 )
 
 
@@ -45,6 +47,128 @@ def test_eval_contract_seeds_expected_artifact_from_prompt(tmp_path, monkeypatch
     manifest = run.artifact_manifest_path.read_text(encoding="utf-8")
     assert "Expected By: `eval_contract`" in manifest
     assert "Status: `expected`" in manifest
+
+
+def test_eval_contract_seeds_and_validates_required_delegate_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_delegate_required",
+        workspace_path=tmp_path,
+        run_id="run_eval_delegate_required",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "report.md"
+    validator_artifact = tmp_path / "live-eval-artifacts" / "validator.md"
+    prompt = (
+        "Hard contract: call artifact_record, delegate_task, and finalize_run.\n"
+        f"Parent artifact: {artifact}\n"
+        "`worker_id`: `sensenova-u1-validator`\n"
+        f"Validator artifact: {validator_artifact}\n"
+    )
+
+    seed = seed_eval_contract_from_prompt(
+        prompt=prompt,
+        session_id="session_eval_delegate_required",
+    )
+
+    contract_text = (run.run_dir / "eval-contract.md").read_text(encoding="utf-8")
+    assert seed["required_delegate_worker_id"] == "sensenova-u1-validator"
+    assert seed["required_delegate_artifact"] == str(validator_artifact)
+    assert "- Required Delegate Worker ID: `sensenova-u1-validator`" in contract_text
+    assert f"- Required Delegate Artifact: `{validator_artifact}`" in contract_text
+
+    wrong = validate_delegate_task_against_eval_contract(
+        {
+            "tasks": [
+                {
+                    "goal": "Validate report.",
+                    "worker_id": "worker_auto",
+                    "output_contract": {"expected_artifact": str(validator_artifact)},
+                    "expected_artifact_paths": [str(validator_artifact)],
+                }
+            ]
+        }
+    )
+    assert wrong
+    assert "sensenova-u1-validator" in wrong[0]
+
+    missing_artifact = validate_delegate_task_against_eval_contract(
+        {
+            "tasks": [
+                {
+                    "goal": "Validate report.",
+                    "worker_id": "sensenova-u1-validator",
+                    "output_contract": {"required_sections": ["verdict"]},
+                }
+            ]
+        }
+    )
+    assert missing_artifact
+    assert "Required delegate artifact" in missing_artifact[0] or "requires delegate artifact" in missing_artifact[0]
+
+    correct = validate_delegate_task_against_eval_contract(
+        {
+            "tasks": [
+                {
+                    "goal": "Validate report.",
+                    "worker_id": "sensenova-u1-validator",
+                    "output_contract": {"expected_artifact": str(validator_artifact)},
+                    "expected_artifact_paths": [str(validator_artifact)],
+                }
+            ]
+        }
+    )
+    assert correct == []
+
+
+def test_eval_contract_seeds_natural_research_prompt_with_delegate_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_natural_research",
+        workspace_path=tmp_path,
+        run_id="run_eval_natural_research",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "sensenova-parent.md"
+    validator_artifact = tmp_path / "live-eval-artifacts" / "sensenova-validator.md"
+    prompt = f"""
+# SenseNova-U1 Research Eval
+
+You are running under Vesta eval mode. This is a research workflow test, not a coding task.
+
+Expected parent research artifact:
+
+`{artifact}`
+
+Expected validator artifact:
+
+`{validator_artifact}`
+
+Operating requirements:
+
+5. Use `delegate_task` at least once for an independent validator lane.
+   - Use `worker_id`: `sensenova-u1-validator`.
+   - Use an `output_contract` object containing:
+     - `expected_artifact`: `{validator_artifact}`
+   - Use `expected_artifact_paths` containing the validator artifact path.
+10. Finalize the run.
+11. Write a control-plane snapshot.
+"""
+
+    seed = seed_eval_contract_from_prompt(
+        prompt=prompt,
+        session_id="session_eval_natural_research",
+    )
+
+    contract_text = (run.run_dir / "eval-contract.md").read_text(encoding="utf-8")
+    assert seed["seeded"] is True
+    assert seed["expected_artifact"] == str(artifact)
+    assert seed["contract_profile"] == "research_ledger"
+    assert seed["required_delegate_worker_id"] == "sensenova-u1-validator"
+    assert seed["required_delegate_artifact"] == str(validator_artifact)
+    assert f"- Expected Artifact: `{artifact}`" in contract_text
+    assert "- Required Delegate Worker ID: `sensenova-u1-validator`" in contract_text
+    assert f"- Required Delegate Artifact: `{validator_artifact}`" in contract_text
 
 
 def test_eval_contract_blocks_terminal_simulated_vesta_state(tmp_path, monkeypatch):
@@ -233,6 +357,69 @@ def test_research_ledger_contract_allows_ledger_before_artifact_write(tmp_path, 
     assert result["compliant"] is True
     assert result["contract_profile"] == "research_ledger"
     assert "Verdict: `accepted`" in run.finalization_path.read_text(encoding="utf-8")
+
+
+def test_evidence_workflow_contract_accepts_section_writer_without_artifact_record_ceremony(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_evidence_workflow",
+        workspace_path=tmp_path,
+        run_id="run_eval_evidence_workflow",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "evidence.md"
+    seed = seed_eval_contract_from_prompt(
+        prompt=(
+            "Vesta eval mode current-world evidence workflow. "
+            f"Expected parent artifact: {artifact}. "
+            "Success criteria: finalize the run and write a control-plane snapshot."
+        ),
+        session_id="session_eval_evidence_workflow",
+    )
+    write_research_artifact_section(
+        path=str(artifact),
+        section="sources",
+        content="- Source: official page; Signal: direct current evidence.",
+        session_id="session_eval_evidence_workflow",
+    )
+    append_ledger_entry(
+        entry_type="verification",
+        title="Evidence artifact checked",
+        statement="The evidence artifact was written through the typed section writer.",
+        refs=[str(artifact)],
+        status="supported",
+        materiality="high",
+        session_id="session_eval_evidence_workflow",
+    )
+    write_finalization(
+        objective="Run evidence workflow eval.",
+        verification="Typed section writer produced the artifact and ledger recorded verification.",
+        session_id="session_eval_evidence_workflow",
+    )
+    messages = [
+        _tool_call(
+            "research_artifact_section_write",
+            {"path": str(artifact), "section": "sources", "content": "official source"},
+        ),
+        _tool_call("ledger_append", {"entry_type": "verification", "materiality": "high"}),
+        _tool_call("finalize_run", {"objective": "Run evidence workflow eval."}),
+        _tool_call("artifact_record", {"path": str(artifact), "status": "exists"}),
+    ]
+
+    result = enforce_eval_contract(
+        messages=messages,
+        final_response=f"Finalization verdict: accepted; report path: {artifact}",
+        objective="Run evidence workflow eval.",
+        session_id="session_eval_evidence_workflow",
+    )
+
+    assert seed["contract_profile"] == "research_ledger"
+    assert seed["required_delegate_worker_id"] == ""
+    assert result["checked"] is True
+    assert result["compliant"] is True
+    assert result["contract_profile"] == "research_ledger"
+    assert "Expected By: `eval_contract`" in run.artifact_manifest_path.read_text(encoding="utf-8")
+    assert "Expected By: `research_artifact_section_write`" in run.artifact_manifest_path.read_text(encoding="utf-8")
 
 
 def test_eval_contract_blocks_forbidden_override_args(tmp_path, monkeypatch):
