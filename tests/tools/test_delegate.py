@@ -29,6 +29,8 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _build_child_tool_surface_contract,
+    _toolsets_include_external_evidence_tools,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -169,6 +171,59 @@ class TestChildSystemPrompt(unittest.TestCase):
 
         self.assertIn("Vesta closure discipline", prompt)
         self.assertIn("verify material actions", prompt)
+
+    def test_can_include_external_evidence_contract(self):
+        prompt = _build_child_system_prompt(
+            "Research current vendor docs",
+            include_external_evidence_contract=True,
+        )
+
+        self.assertIn("External evidence discipline", prompt)
+        self.assertIn("concrete online signal", prompt)
+        self.assertIn("speculation", prompt)
+
+    def test_web_toolsets_trigger_external_evidence_contract_detection(self):
+        self.assertTrue(_toolsets_include_external_evidence_tools(["web"]))
+        self.assertTrue(_toolsets_include_external_evidence_tools(["browser"]))
+        self.assertTrue(_toolsets_include_external_evidence_tools(["terminal"]))
+        self.assertFalse(_toolsets_include_external_evidence_tools(["file"]))
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_web_children_receive_external_evidence_contract(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["web"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.valid_tool_names = {"web_search", "web_extract"}
+            MockAgent.return_value = mock_child
+            _build_child_agent(
+                task_index=0,
+                goal="Research current Milan weather.",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        prompt = MockAgent.call_args[1]["ephemeral_system_prompt"]
+        self.assertIn("External evidence discipline", prompt)
+        self.assertIn("current or changing external reality", prompt)
+        self.assertEqual(MockAgent.call_args[1]["enabled_toolsets"], ["web"])
+        self.assertIn("Delegated tool surface", mock_child.ephemeral_system_prompt)
+        self.assertIn("web_search", mock_child.ephemeral_system_prompt)
+
+    def test_child_tool_surface_contract_reports_missing_capabilities(self):
+        prompt = _build_child_tool_surface_contract(["file"], {"read_file", "write_file"})
+
+        self.assertIn("Delegated tool surface", prompt)
+        self.assertIn("Configured child toolsets: file", prompt)
+        self.assertIn("read_file", prompt)
+        self.assertIn("write_file", prompt)
+        self.assertIn("capability gap", prompt)
+        self.assertIn("capability boundary", prompt)
 
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_file_tool_children_receive_vesta_retrieval_contract(self, mock_cfg):

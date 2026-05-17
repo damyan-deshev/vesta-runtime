@@ -769,6 +769,7 @@ def _build_child_system_prompt(
     child_depth: int = 1,
     include_vesta_retrieval_contract: bool = False,
     include_vesta_closure_contract: bool = False,
+    include_external_evidence_contract: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -821,6 +822,17 @@ def _build_child_system_prompt(
             closure_contract = ""
         if closure_contract:
             parts.append("\n" + closure_contract)
+    if include_external_evidence_contract:
+        try:
+            from vesta_runtime.external_evidence import (
+                build_external_evidence_prompt_contract,
+            )
+
+            evidence_contract = build_external_evidence_prompt_contract()
+        except Exception:
+            evidence_contract = ""
+        if evidence_contract:
+            parts.append("\n" + evidence_contract)
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -855,6 +867,46 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
+def _build_child_tool_surface_contract(
+    toolsets: List[str],
+    tool_names: Any,
+    *,
+    max_tool_names: int = 80,
+) -> str:
+    """Return a compact child-specific capability contract.
+
+    The normal system prompt and API tool schema still describe individual
+    tools. This block makes the delegated capability boundary explicit: a
+    child may have a smaller or differently filtered tool surface than the
+    parent, and must report missing capabilities instead of simulating them.
+    """
+
+    configured_toolsets = [str(name) for name in (toolsets or []) if str(name).strip()]
+    if isinstance(tool_names, (set, list, tuple, frozenset)):
+        available_tools = sorted(str(name) for name in tool_names if str(name).strip())
+    else:
+        available_tools = []
+
+    if len(available_tools) > max_tool_names:
+        visible_tools = available_tools[:max_tool_names]
+        tool_suffix = f" (+{len(available_tools) - max_tool_names} more)"
+    else:
+        visible_tools = available_tools
+        tool_suffix = ""
+
+    toolset_text = ", ".join(configured_toolsets) if configured_toolsets else "none"
+    tool_text = ", ".join(visible_tools) + tool_suffix if visible_tools else "none"
+
+    return (
+        "Delegated tool surface:\n"
+        f"- Configured child toolsets: {toolset_text}\n"
+        f"- Tools actually loaded for this child: {tool_text}\n"
+        "- Treat this list as the capability boundary for your delegated work, even if the parent may have more tools.\n"
+        "- If the task requires a missing capability, report a capability gap to the parent instead of pretending the work was performed.\n"
+        "- If the task requires current-world evidence, use an available online-capable tool from this list; if none is available, mark current-world claims as unverified/speculation."
+    )
+
+
 def _toolsets_include_read_tools(toolsets: List[str]) -> bool:
     for name in toolsets:
         try:
@@ -876,6 +928,25 @@ def _toolsets_include_vesta_state_tools(toolsets: List[str]) -> bool:
         except Exception:
             resolved = set(TOOLSETS.get(name, {}).get("tools", []))
         if _VESTA_STATE_TOOLS.issubset(resolved):
+            return True
+    return False
+
+
+def _toolsets_include_external_evidence_tools(toolsets: List[str]) -> bool:
+    online_capable_tools = {
+        "web_search",
+        "web_extract",
+        "browser_navigate",
+        "browser_snapshot",
+        "terminal",
+        "execute_code",
+    }
+    for name in toolsets:
+        try:
+            resolved = set(resolve_toolset(name))
+        except Exception:
+            resolved = set(TOOLSETS.get(name, {}).get("tools", []))
+        if online_capable_tools & resolved:
             return True
     return False
 
@@ -1228,6 +1299,9 @@ def _build_child_agent(
             _toolsets_include_vesta_state_tools(child_toolsets)
             or _parent_has_vesta_state_tools(parent_agent)
         ),
+        include_external_evidence_contract=_toolsets_include_external_evidence_tools(
+            child_toolsets
+        ),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1388,6 +1462,14 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )
+    child.ephemeral_system_prompt = (
+        child_prompt
+        + "\n\n"
+        + _build_child_tool_surface_contract(
+            child_toolsets,
+            getattr(child, "valid_tool_names", None),
+        )
+    ).strip()
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
