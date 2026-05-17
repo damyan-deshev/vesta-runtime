@@ -191,7 +191,7 @@ _TOOL_STUBS = {
     "web_extract": (
         "web_extract",
         "urls: list",
-        '"""Extract content from URLs. Returns dict with results list of {url, title, content, error}."""',
+        '"""Extract normalized markdown/text evidence from URLs. Returns {results:[{url,title,content,error}]}; content is not raw HTML/JS/DOM."""',
         '{"urls": urls}',
     ),
     "read_file": (
@@ -1651,7 +1651,7 @@ _TOOL_DOC_LINES = [
      "    Returns {\"data\": {\"web\": [{\"url\", \"title\", \"description\"}, ...]}}"),
     ("web_extract",
      "  web_extract(urls: list[str]) -> dict\n"
-     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown"),
+     "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is normalized markdown/text evidence, not raw HTML/JS/DOM"),
     ("read_file",
      "  read_file(path: str, offset: int = 1, limit: int = 180, complete_coverage: bool = False, broad_read_reason: str = None) -> dict\n"
      "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}. Deliberate broad reads need complete_coverage or broad_read_reason."),

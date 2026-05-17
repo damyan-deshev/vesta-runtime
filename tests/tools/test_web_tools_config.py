@@ -509,6 +509,54 @@ class TestWebSearchSchema:
         fake_search.assert_called_once_with("docs", 100)
 
 
+class TestWebExtractSchema:
+    """Test suite for web_extract tool schema and output contract."""
+
+    def test_schema_sets_normalized_text_expectation(self):
+        import tools.web_tools
+
+        desc = tools.web_tools.WEB_EXTRACT_SCHEMA["description"]
+
+        assert "normalized text evidence" in desc
+        assert "not raw HTML, JavaScript, DOM nodes" in desc
+        assert "Do not repeat web_extract waiting for DOM-like output" in desc
+
+    @pytest.mark.asyncio
+    async def test_result_marks_content_as_normalized_text(self):
+        import tools.web_tools
+
+        fake_provider = MagicMock(
+            name="FakeExtractProvider",
+            supports_extract=MagicMock(return_value=True),
+        )
+        fake_provider.name = "fake"
+        fake_provider.extract.return_value = [
+            {
+                "url": "https://example.com",
+                "title": "Example",
+                "content": "# Heading\nBody text",
+            }
+        ]
+
+        with patch("tools.web_tools._get_extract_backend", return_value="fake"), \
+             patch("agent.web_search_registry.get_provider", return_value=fake_provider), \
+             patch("tools.web_tools.check_auxiliary_model", return_value=False), \
+             patch("tools.web_tools.is_safe_url", return_value=True), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch.object(tools.web_tools._debug, "log_call"), \
+             patch.object(tools.web_tools._debug, "save"):
+            result = json.loads(
+                await tools.web_tools.web_extract_tool(
+                    ["https://example.com"],
+                    use_llm_processing=False,
+                )
+            )
+
+        assert result["content_format"] == "normalized_markdown_text_evidence_not_dom"
+        assert "not raw HTML" in result["content_note"]
+        assert result["results"][0]["content"] == "# Heading\nBody text"
+
+
 class TestWebSearchErrorHandling:
     """Test suite for web_search_tool() error responses."""
 

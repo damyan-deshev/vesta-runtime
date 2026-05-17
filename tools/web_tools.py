@@ -1088,7 +1088,14 @@ async def web_extract_tool(
             }
             for r in response.get("results", [])
         ]
-        trimmed_response = {"results": trimmed_results}
+        trimmed_response = {
+            "content_format": "normalized_markdown_text_evidence_not_dom",
+            "content_note": (
+                "Each result.content is normalized markdown/text evidence, not raw HTML, "
+                "JavaScript, DOM nodes, browser element refs, or a live page."
+            ),
+            "results": trimmed_results,
+        }
 
         if trimmed_response.get("results") == []:
             result_json = tool_error("Content was inaccessible or not found")
@@ -1512,7 +1519,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
+    "description": "Extract normalized text evidence from web page URLs. Returns page content in markdown format, not raw HTML, JavaScript, DOM nodes, browser element refs, or a live page. Do not repeat web_extract waiting for DOM-like output; use browser tools only when you need interaction, rendered page state, element refs, visual checks, or JavaScript behavior. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -91,6 +91,11 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def web_search(", src)
         self.assertNotIn("def read_file(", src)
 
+    def test_web_extract_stub_sets_normalized_text_expectation(self):
+        src = generate_hermes_tools_module(["web_extract"])
+        self.assertIn("normalized markdown/text evidence", src)
+        self.assertIn("not raw HTML/JS/DOM", src)
+
     def test_empty_list_generates_nothing(self):
         src = generate_hermes_tools_module([])
         self.assertNotIn("def terminal(", src)
@@ -576,6 +581,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         desc = schema["description"]
         self.assertIn("terminal(", desc)
         self.assertNotIn("web_search(", desc)
+
+    def test_web_extract_docs_set_normalized_text_expectation(self):
+        schema = build_execute_code_schema({"web_extract"})
+        desc = schema["description"]
+        self.assertIn("normalized markdown/text evidence", desc)
+        self.assertIn("not raw HTML/JS/DOM", desc)
 
     def test_import_examples_prefer_web_search_and_terminal(self):
         enabled = {"web_search", "terminal", "read_file"}
