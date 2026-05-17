@@ -768,6 +768,7 @@ def _build_child_system_prompt(
     max_spawn_depth: int = 2,
     child_depth: int = 1,
     include_vesta_retrieval_contract: bool = False,
+    include_vesta_closure_contract: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -811,6 +812,15 @@ def _build_child_system_prompt(
             retrieval_contract = ""
         if retrieval_contract:
             parts.append("\n" + retrieval_contract)
+    if include_vesta_closure_contract:
+        try:
+            from vesta_runtime.closure import build_closure_prompt_contract
+
+            closure_contract = build_closure_prompt_contract()
+        except Exception:
+            closure_contract = ""
+        if closure_contract:
+            parts.append("\n" + closure_contract)
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -853,6 +863,30 @@ def _toolsets_include_read_tools(toolsets: List[str]) -> bool:
             resolved = set(TOOLSETS.get(name, {}).get("tools", []))
         if {"read_file", "search_files"}.issubset(resolved):
             return True
+    return False
+
+
+_VESTA_STATE_TOOLS = {"ledger_append", "run_status", "finalize_run"}
+
+
+def _toolsets_include_vesta_state_tools(toolsets: List[str]) -> bool:
+    for name in toolsets:
+        try:
+            resolved = set(resolve_toolset(name))
+        except Exception:
+            resolved = set(TOOLSETS.get(name, {}).get("tools", []))
+        if _VESTA_STATE_TOOLS.issubset(resolved):
+            return True
+    return False
+
+
+def _parent_has_vesta_state_tools(parent_agent) -> bool:
+    names = getattr(parent_agent, "valid_tool_names", None)
+    if isinstance(names, (list, tuple, set, frozenset)):
+        return _VESTA_STATE_TOOLS.issubset(set(names))
+    enabled = getattr(parent_agent, "enabled_toolsets", None)
+    if isinstance(enabled, (list, tuple, set, frozenset)):
+        return _toolsets_include_vesta_state_tools(list(enabled))
     return False
 
 
@@ -1190,6 +1224,10 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
         include_vesta_retrieval_contract=_toolsets_include_read_tools(child_toolsets),
+        include_vesta_closure_contract=(
+            _toolsets_include_vesta_state_tools(child_toolsets)
+            or _parent_has_vesta_state_tools(parent_agent)
+        ),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)

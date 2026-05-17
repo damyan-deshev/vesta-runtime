@@ -1008,6 +1008,30 @@ class TestBuildSystemPrompt:
         assert "Vesta retrieval discipline" in prompt
         assert "locator first" in prompt
 
+    def test_includes_vesta_closure_guidance_when_state_tools_loaded(self):
+        tools = _make_tool_defs("ledger_append", "run_status", "finalize_run")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "vesta_runtime.closure.build_closure_prompt_contract",
+                return_value="Vesta closure discipline:\n- verify material actions",
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "Vesta closure discipline" in prompt
+        assert "verify material actions" in prompt
+
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"

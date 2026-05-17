@@ -35,6 +35,7 @@ from .eval_contract import (
     eval_mode_enabled,
     seed_eval_contract_from_prompt,
 )
+from .closure import build_closure_prompt_contract
 
 __all__ = [
     "VestaRun",
@@ -65,4 +66,5 @@ __all__ = [
     "enforce_eval_contract",
     "eval_mode_enabled",
     "seed_eval_contract_from_prompt",
+    "build_closure_prompt_contract",
 ]

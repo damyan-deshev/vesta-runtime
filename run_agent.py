@@ -6248,6 +6248,16 @@ class AIAgent:
             if retrieval_contract:
                 stable_parts.append(retrieval_contract)
 
+        if {"ledger_append", "run_status", "finalize_run"}.issubset(self.valid_tool_names):
+            try:
+                from vesta_runtime.closure import build_closure_prompt_contract
+
+                closure_contract = build_closure_prompt_contract()
+            except Exception:
+                closure_contract = ""
+            if closure_contract:
+                stable_parts.append(closure_contract)
+
         # Computer-use (macOS) — goes in as its own block rather than being
         # merged into tool_guidance because the content is multi-paragraph.
         if "computer_use" in self.valid_tool_names:

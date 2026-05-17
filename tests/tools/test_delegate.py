@@ -157,6 +157,19 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Vesta retrieval discipline", prompt)
         self.assertIn("locator first", prompt)
 
+    def test_can_include_vesta_closure_contract(self):
+        with patch(
+            "vesta_runtime.closure.build_closure_prompt_contract",
+            return_value="Vesta closure discipline:\n- verify material actions",
+        ):
+            prompt = _build_child_system_prompt(
+                "Inspect source",
+                include_vesta_closure_contract=True,
+            )
+
+        self.assertIn("Vesta closure discipline", prompt)
+        self.assertIn("verify material actions", prompt)
+
     @patch("tools.delegate_tool._load_config", return_value={})
     def test_file_tool_children_receive_vesta_retrieval_contract(self, mock_cfg):
         parent = _make_mock_parent()
@@ -184,6 +197,35 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = MockAgent.call_args[1]["ephemeral_system_prompt"]
         self.assertIn("Vesta retrieval discipline", prompt)
         self.assertIn("locator first", prompt)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_vesta_parent_children_receive_closure_contract(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["file"]
+        parent.valid_tool_names = ["ledger_append", "run_status", "finalize_run"]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "vesta_runtime.closure.build_closure_prompt_contract",
+                return_value="Vesta closure discipline:\n- verify material actions",
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect source",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        prompt = MockAgent.call_args[1]["ephemeral_system_prompt"]
+        self.assertIn("Vesta closure discipline", prompt)
+        self.assertIn("verify material actions", prompt)
 
 
 class TestStripBlockedTools(unittest.TestCase):
