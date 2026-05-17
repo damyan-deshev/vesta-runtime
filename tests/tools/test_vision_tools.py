@@ -19,6 +19,7 @@ from tools.vision_tools import (
     _is_image_size_error,
     _MAX_BASE64_BYTES,
     _RESIZE_TARGET_BYTES,
+    _explicit_vision_config_present,
     vision_analyze_tool,
     check_vision_requirements,
 )
@@ -508,6 +509,39 @@ class TestVisionRequirements:
     def test_check_requirements_returns_bool(self):
         result = check_vision_requirements()
         assert isinstance(result, bool)
+
+    def test_check_requirements_rejects_implicit_custom_text_provider(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("AUXILIARY_VISION_PROVIDER", raising=False)
+        monkeypatch.delenv("AUXILIARY_VISION_BASE_URL", raising=False)
+        monkeypatch.delenv("AUXILIARY_VISION_API_KEY", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  provider: custom:vesta-local-llama\n  default: local-text\n"
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", object(), "local-text"),
+        ):
+            assert _explicit_vision_config_present() is False
+            assert check_vision_requirements() is False
+
+    def test_check_requirements_allows_explicit_custom_vision_provider(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: custom:vesta-local-llama\n"
+            "  default: local-text\n"
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: custom\n"
+            "    base_url: http://127.0.0.1:8000/v1\n"
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", object(), "local-vision"),
+        ):
+            assert _explicit_vision_config_present() is True
+            assert check_vision_requirements() is True
 
     def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

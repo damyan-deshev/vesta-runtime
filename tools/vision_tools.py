@@ -913,12 +913,40 @@ async def vision_analyze_tool(
                 )
 
 
+def _explicit_vision_config_present() -> bool:
+    if os.getenv("AUXILIARY_VISION_PROVIDER", "").strip():
+        return True
+    if os.getenv("AUXILIARY_VISION_BASE_URL", "").strip():
+        return True
+    if os.getenv("AUXILIARY_VISION_API_KEY", "").strip():
+        return True
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config() or {}
+        vision_cfg = cfg_get(cfg, "auxiliary", "vision", default={})
+    except Exception:
+        return False
+    if not isinstance(vision_cfg, dict):
+        return False
+    provider = str(vision_cfg.get("provider") or "").strip().lower()
+    if provider and provider != "auto":
+        return True
+    if str(vision_cfg.get("base_url") or "").strip():
+        return True
+    if str(vision_cfg.get("api_key") or "").strip():
+        return True
+    return False
+
+
 def check_vision_requirements() -> bool:
     """Check if the configured runtime vision path can resolve a client."""
     try:
         from agent.auxiliary_client import resolve_vision_provider_client
 
-        _provider, client, _model = resolve_vision_provider_client()
+        provider, client, _model = resolve_vision_provider_client()
+        if str(provider or "").startswith("custom") and not _explicit_vision_config_present():
+            return False
         return client is not None
     except Exception:
         return False

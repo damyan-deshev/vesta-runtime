@@ -161,6 +161,7 @@ class TestBrowserVisionAnnotate:
             patch("tools.browser_tool._run_browser_command") as mock_cmd,
             patch("tools.browser_tool.call_llm") as mock_call_llm,
             patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None),
         ):
             mock_cmd.return_value = {"success": True, "data": {}}
             # Will fail at screenshot file read, but we can check the command
@@ -182,6 +183,7 @@ class TestBrowserVisionAnnotate:
             patch("tools.browser_tool._run_browser_command") as mock_cmd,
             patch("tools.browser_tool.call_llm") as mock_call_llm,
             patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None),
         ):
             mock_cmd.return_value = {"success": True, "data": {}}
             try:
@@ -217,6 +219,7 @@ class TestBrowserVisionConfig:
             patch("tools.browser_tool._cleanup_old_screenshots"),
             patch("tools.browser_tool._run_browser_command", return_value={"success": True, "data": {"path": str(screenshot)}}),
             patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None),
             patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {"temperature": 1, "timeout": 45}}}),
             patch("tools.browser_tool.call_llm", return_value=mock_response) as mock_llm,
         ):
@@ -241,6 +244,7 @@ class TestBrowserVisionConfig:
             patch("tools.browser_tool._cleanup_old_screenshots"),
             patch("tools.browser_tool._run_browser_command", return_value={"success": True, "data": {"path": str(screenshot)}}),
             patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None),
             patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {}}}),
             patch("tools.browser_tool.call_llm", return_value=mock_response) as mock_llm,
         ):
@@ -250,6 +254,78 @@ class TestBrowserVisionConfig:
         assert result["analysis"] == "Default screenshot analysis"
         assert mock_llm.call_args.kwargs["temperature"] == 0.1
         assert mock_llm.call_args.kwargs["timeout"] == 120.0
+
+    def test_browser_vision_unavailable_fails_before_screenshot(self):
+        from tools.browser_tool import browser_vision
+
+        with (
+            patch("tools.browser_tool._browser_vision_unavailable_reason", return_value="No vision backend"),
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+        ):
+            result = json.loads(browser_vision("what is on the page?", task_id="test"))
+
+        assert result["success"] is False
+        assert result["code"] == "browser_vision_unavailable"
+        assert "browser_extract" in result["repair_hint"]
+        mock_cmd.assert_not_called()
+
+    def test_browser_vision_schema_omitted_when_vision_backend_unavailable(self):
+        import tools.browser_tool as bt
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        invalidate_check_fn_cache()
+        try:
+            with (
+                patch("tools.browser_tool.check_browser_requirements", return_value=True),
+                patch("tools.browser_tool._browser_vision_unavailable_reason", return_value="No vision backend"),
+            ):
+                definitions = registry.get_definitions({"browser_vision"}, quiet=True)
+        finally:
+            invalidate_check_fn_cache()
+
+        assert bt.registry is registry
+        assert definitions == []
+
+    def test_browser_vision_rejects_implicit_custom_text_provider(self):
+        from tools.browser_tool import _browser_vision_unavailable_reason
+
+        env = {
+            "AUXILIARY_VISION_PROVIDER": "",
+            "AUXILIARY_VISION_BASE_URL": "",
+            "AUXILIARY_VISION_API_KEY": "",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("custom:vesta-local-llama", object(), "text-model"),
+            ),
+            patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {"provider": "auto"}}}),
+        ):
+            reason = _browser_vision_unavailable_reason()
+
+        assert reason is not None
+        assert "explicit auxiliary.vision" in reason
+
+    def test_browser_vision_allows_explicit_custom_vision_provider(self):
+        from tools.browser_tool import _browser_vision_unavailable_reason
+
+        env = {
+            "AUXILIARY_VISION_PROVIDER": "",
+            "AUXILIARY_VISION_BASE_URL": "",
+            "AUXILIARY_VISION_API_KEY": "",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                return_value=("custom", object(), "qwen-vl"),
+            ),
+            patch("hermes_cli.config.load_config", return_value={"auxiliary": {"vision": {"provider": "custom"}}}),
+        ):
+            reason = _browser_vision_unavailable_reason()
+
+        assert reason is None
 
 
 # ── auto-recording config ────────────────────────────────────────────

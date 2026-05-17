@@ -27,6 +27,15 @@ from vesta_runtime import (
 )
 
 
+def _note_runtime_progress(kind: str) -> None:
+    try:
+        from tools.tool_output_limits import note_vesta_runtime_progress
+
+        note_vesta_runtime_progress(kind)
+    except Exception:
+        pass
+
+
 LEDGER_APPEND_SCHEMA = {
     "name": "ledger_append",
     "description": (
@@ -455,6 +464,7 @@ def _handle_ledger_append(args, **kw) -> str:
             session_id=os.getenv("HERMES_SESSION_ID", ""),
             actor="agent",
         )
+        _note_runtime_progress("ledger_append")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -542,6 +552,7 @@ def _handle_artifact_record(args, **kw) -> str:
             impact_if_missing=args.get("impact_if_missing", ""),
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
+        _note_runtime_progress("artifact_record")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -560,6 +571,7 @@ def _handle_finalize_run(args, **kw) -> str:
             next_action=args.get("next_action") or None,
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
+        _note_runtime_progress("finalize_run")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -585,6 +597,7 @@ def _handle_worker_state_record(args, **kw) -> str:
             next_action=args.get("next_action", ""),
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
+        _note_runtime_progress("worker_state_record")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -649,6 +662,7 @@ def _handle_validator_result_record(args, **kw) -> str:
             skip_reason=args.get("skip_reason", ""),
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
+        _note_runtime_progress("validator_result_record")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -660,6 +674,7 @@ def _handle_control_plane_snapshot(args, **kw) -> str:
             next_action=args.get("next_action", ""),
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
+        _note_runtime_progress("control_plane_snapshot")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
@@ -710,12 +725,7 @@ def _handle_research_artifact_section_write(args, **kw) -> str:
             content=args.get("content", ""),
             session_id=os.getenv("HERMES_SESSION_ID", ""),
         )
-        try:
-            from tools.tool_output_limits import note_vesta_artifact_checkpoint
-
-            note_vesta_artifact_checkpoint()
-        except Exception:
-            pass
+        _note_runtime_progress("research_artifact_section_write")
         return json.dumps({"success": True, **result}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)

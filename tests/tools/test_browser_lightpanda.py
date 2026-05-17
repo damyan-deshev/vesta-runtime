@@ -422,6 +422,7 @@ class TestLightpandaFallbackWarning:
 
         with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
              patch("tools.browser_tool._should_inject_engine", return_value=True), \
+             patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None), \
              patch("tools.browser_tool._chrome_fallback_screenshot", return_value={
                  "success": True, "data": {"path": str(chrome_shot)}
              }), \
@@ -473,6 +474,7 @@ class TestLightpandaFallbackWarning:
 
         with patch("tools.browser_tool._get_browser_engine", return_value="lightpanda"), \
              patch("tools.browser_tool._should_inject_engine", return_value=True), \
+             patch("tools.browser_tool._browser_vision_unavailable_reason", return_value=None), \
              patch("tools.browser_tool._chrome_fallback_screenshot", return_value={
                  "success": True, "data": {"path": str(chrome_shot)}
              }), \

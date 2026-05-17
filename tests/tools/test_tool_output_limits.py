@@ -337,12 +337,13 @@ class TestDefaultConfigHasSection:
 
 
 class TestVestaCheckpointPressure:
-    def test_checkpoint_notice_after_many_evidence_calls_until_artifact_checkpoint(self, tmp_path):
+    def test_checkpoint_notice_resets_on_new_artifact_progress_then_counts_again(self, tmp_path):
         manifest_path = tmp_path / "artifact-manifest.md"
         manifest_path.write_text("# Artifact Manifest\n", encoding="utf-8")
         run = SimpleNamespace(run_dir=tmp_path / "run", artifact_manifest_path=manifest_path)
         cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
         tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+        tol._VESTA_ARTIFACT_PROGRESS_BY_RUN.clear()
 
         with patch("vesta_runtime.get_current_run", return_value=run), \
              patch("hermes_cli.config.load_config", return_value=cfg):
@@ -365,7 +366,38 @@ class TestVestaCheckpointPressure:
         with patch("vesta_runtime.get_current_run", return_value=run), \
              patch("hermes_cli.config.load_config", return_value=cfg):
             assert tol.vesta_evidence_checkpoint_notice("read_file") is None
-        assert tol._VESTA_EVIDENCE_COUNT_BY_RUN == {}
+            assert tol._VESTA_EVIDENCE_COUNT_BY_RUN == {}
+            notices_after_progress = [
+                tol.vesta_evidence_checkpoint_notice("browser_extract")
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT)
+            ]
+            notice_after_progress = tol.vesta_evidence_checkpoint_notice("browser_extract")
+        assert all(item is None for item in notices_after_progress)
+        assert notice_after_progress["vesta_checkpoint_required"] is True
+        assert notice_after_progress["source"] == "browser_extract"
+
+    def test_runtime_progress_note_resets_checkpoint_pressure(self, tmp_path):
+        run = SimpleNamespace(run_dir=tmp_path / "run", artifact_manifest_path=tmp_path / "manifest.md")
+        cfg = {"vesta": {"retrieval": {"mode": "disciplined"}}}
+        tol._VESTA_EVIDENCE_COUNT_BY_RUN.clear()
+        tol._VESTA_ARTIFACT_PROGRESS_BY_RUN.clear()
+
+        with patch("vesta_runtime.get_current_run", return_value=run), \
+             patch("hermes_cli.config.load_config", return_value=cfg):
+            for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT):
+                assert tol.vesta_evidence_checkpoint_notice("terminal") is None
+            assert tol.vesta_evidence_checkpoint_notice("terminal") is not None
+
+            tol.note_vesta_runtime_progress("ledger_append")
+
+            notices_after_progress = [
+                tol.vesta_evidence_checkpoint_notice("terminal")
+                for _ in range(tol.VESTA_CHECKPOINT_RETRIEVAL_LIMIT)
+            ]
+            notice_after_progress = tol.vesta_evidence_checkpoint_notice("terminal")
+
+        assert all(item is None for item in notices_after_progress)
+        assert notice_after_progress["vesta_checkpoint_required"] is True
 
 
 class TestIntegrationReadPagination:

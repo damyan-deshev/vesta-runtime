@@ -44,6 +44,7 @@ VESTA_CONTEXT_CAP_DIVISOR = 8
 VESTA_CONTEXT_CAP_FLOOR = 4_000
 VESTA_CHECKPOINT_RETRIEVAL_LIMIT = 12
 _VESTA_EVIDENCE_COUNT_BY_RUN: dict[str, int] = {}
+_VESTA_ARTIFACT_PROGRESS_BY_RUN: dict[str, str] = {}
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -183,23 +184,35 @@ def _vesta_run_key(run: Any) -> str:
     return str(id(run))
 
 
-def _vesta_has_artifact_checkpoint(run: Any) -> bool:
+def _vesta_artifact_checkpoint_fingerprint(run: Any) -> str | None:
     try:
         manifest_path = getattr(run, "artifact_manifest_path", None)
         if not manifest_path:
-            return False
+            return None
         text = manifest_path.read_text(encoding="utf-8")
+        stat = manifest_path.stat()
     except Exception:
-        return False
-    return "Expected By: `research_artifact_section_write`" in text
+        return None
+    if "Expected By: `research_artifact_section_write`" not in text:
+        return None
+    return f"{stat.st_mtime_ns}:{len(text)}"
+
+
+def note_vesta_runtime_progress(kind: str = "progress") -> None:
+    """Reset evidence-retrieval pressure after durable Vesta progress."""
+    run = _current_vesta_run()
+    if run is None:
+        return
+    key = _vesta_run_key(run)
+    _VESTA_EVIDENCE_COUNT_BY_RUN.pop(key, None)
+    fingerprint = _vesta_artifact_checkpoint_fingerprint(run)
+    if fingerprint:
+        _VESTA_ARTIFACT_PROGRESS_BY_RUN[key] = fingerprint
 
 
 def note_vesta_artifact_checkpoint() -> None:
     """Reset the evidence-retrieval pressure counter after an artifact write."""
-    run = _current_vesta_run()
-    if run is None:
-        return
-    _VESTA_EVIDENCE_COUNT_BY_RUN.pop(_vesta_run_key(run), None)
+    note_vesta_runtime_progress("artifact")
 
 
 def vesta_evidence_checkpoint_notice(source: str) -> Dict[str, Any] | None:
@@ -221,7 +234,9 @@ def vesta_evidence_checkpoint_notice(source: str) -> Dict[str, Any] | None:
         return None
 
     key = _vesta_run_key(run)
-    if _vesta_has_artifact_checkpoint(run):
+    artifact_fingerprint = _vesta_artifact_checkpoint_fingerprint(run)
+    if artifact_fingerprint and _VESTA_ARTIFACT_PROGRESS_BY_RUN.get(key) != artifact_fingerprint:
+        _VESTA_ARTIFACT_PROGRESS_BY_RUN[key] = artifact_fingerprint
         _VESTA_EVIDENCE_COUNT_BY_RUN.pop(key, None)
         return None
 
@@ -237,10 +252,11 @@ def vesta_evidence_checkpoint_notice(source: str) -> Dict[str, Any] | None:
         "evidence_call_limit": VESTA_CHECKPOINT_RETRIEVAL_LIMIT,
         "repair_hint": (
             "This Vesta run has gathered many evidence payloads without a "
-            "compact artifact checkpoint. Write a bounded section with "
+            "compact durable checkpoint or compact artifact checkpoint. "
+            "Write a bounded section with "
             "research_artifact_section_write (the current typed evidence "
-            "artifact writer), or record explicit gaps/coverage, before "
-            "requesting more broad evidence."
+            "artifact writer), append a high-signal ledger checkpoint, or "
+            "record explicit gaps/coverage before requesting more broad evidence."
         ),
     }
 

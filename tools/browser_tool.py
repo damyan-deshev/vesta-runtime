@@ -213,6 +213,66 @@ def _get_vision_model() -> Optional[str]:
     return os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
 
 
+def _explicit_browser_vision_config_present() -> bool:
+    if os.getenv("AUXILIARY_VISION_PROVIDER", "").strip():
+        return True
+    if os.getenv("AUXILIARY_VISION_BASE_URL", "").strip():
+        return True
+    if os.getenv("AUXILIARY_VISION_API_KEY", "").strip():
+        return True
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        vision_cfg = cfg_get(cfg, "auxiliary", "vision", default={})
+    except Exception:
+        return False
+    if not isinstance(vision_cfg, dict):
+        return False
+    provider = str(vision_cfg.get("provider") or "").strip().lower()
+    if provider and provider != "auto":
+        return True
+    if str(vision_cfg.get("base_url") or "").strip():
+        return True
+    if str(vision_cfg.get("api_key") or "").strip():
+        return True
+    return False
+
+
+def _browser_vision_unavailable_reason() -> Optional[str]:
+    """Return why browser_vision cannot run, or None when it can."""
+    try:
+        from agent.auxiliary_client import resolve_vision_provider_client
+
+        provider, client, _model = resolve_vision_provider_client(
+            model=_get_vision_model(),
+            async_mode=False,
+        )
+    except Exception as exc:
+        return f"Could not resolve a vision-capable LLM provider: {exc}"
+    if client is None:
+        return "No configured vision-capable LLM provider is available for browser_vision."
+    if str(provider or "").startswith("custom") and not _explicit_browser_vision_config_present():
+        return (
+            "browser_vision resolved the main custom text provider, but no "
+            "explicit auxiliary.vision provider/base_url is configured."
+        )
+    return None
+
+
+def _browser_vision_unavailable_response(reason: str) -> str:
+    return json.dumps({
+        "success": False,
+        "code": "browser_vision_unavailable",
+        "error": reason,
+        "repair_hint": (
+            "Use browser_snapshot or browser_extract for text/markdown page "
+            "evidence, or configure auxiliary.vision provider/model before "
+            "requesting screenshot analysis."
+        ),
+    }, ensure_ascii=False)
+
+
 def _get_extraction_model() -> Optional[str]:
     """Model for page snapshot text summarization — same as web_extract."""
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
@@ -3545,6 +3605,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     Returns:
         JSON string with vision analysis results and screenshot_path
     """
+    unavailable_reason = _browser_vision_unavailable_reason()
+    if unavailable_reason:
+        return _browser_vision_unavailable_response(unavailable_reason)
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
@@ -4131,6 +4195,13 @@ def check_browser_requirements() -> bool:
     return True
 
 
+def check_browser_vision_requirements() -> bool:
+    """Return True only when browser capture and vision analysis can run."""
+    if not check_browser_requirements():
+        return False
+    return _browser_vision_unavailable_reason() is None
+
+
 # ============================================================================
 # Module Test
 # ============================================================================
@@ -4278,7 +4349,7 @@ registry.register(
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
-    check_fn=check_browser_requirements,
+    check_fn=check_browser_vision_requirements,
     emoji="👁️",
 )
 registry.register(
