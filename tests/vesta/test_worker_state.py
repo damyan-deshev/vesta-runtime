@@ -6,10 +6,20 @@ from vesta_runtime import (
     create_run,
     record_validator_result,
     record_worker_state,
+    run_status,
     set_current_run,
     write_control_plane_snapshot,
     write_finalization,
 )
+
+
+def _worker_payloads(run):
+    payloads = []
+    marker = "- Structured Payload: `"
+    for line in run.worker_state_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith(marker) and line.endswith("`"):
+            payloads.append(json.loads(line[len(marker):-1]))
+    return payloads
 
 
 def test_worker_state_records_requested_and_accepted_states(tmp_path):
@@ -275,3 +285,85 @@ def test_delegate_task_records_runtime_worker_boundaries(tmp_path, monkeypatch):
     assert "Validator Status: `passed`" in control_plane
     assert "parent acceptance `unreviewed`" in control_plane
     assert "child session `session_child_0`" in control_plane
+
+
+def test_worker_updates_preserve_existing_contract_metadata(tmp_path, monkeypatch):
+    set_current_run(None)
+    run = create_run(session_id="session_worker_merge", workspace_path=tmp_path, run_id="run_worker_merge")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session_worker_merge")
+    artifact = tmp_path / "reports" / "validator.md"
+    artifact.parent.mkdir()
+    artifact.write_text("validator report", encoding="utf-8")
+
+    record_worker_state(
+        worker_id="s8-runtime-validator",
+        objective="Validate S8 artifact.",
+        status="completed",
+        model_lane="llama.cpp:qwen3.6-35b",
+        output_contract={
+            "expected_artifact": "reports/validator.md",
+            "required_sections": ["verdict"],
+        },
+        child_session_id="session_child",
+        child_run_id="run_child",
+        expected_artifact_paths=["reports/validator.md"],
+        artifact_paths=["reports/validator.md"],
+        material_claims=[
+            {
+                "statement": "Validator artifact exists.",
+                "refs": ["reports/validator.md"],
+            }
+        ],
+        session_id="session_worker_merge",
+    )
+
+    raw = handle_function_call(
+        "worker_state_record",
+        {
+            "worker_id": "s8-runtime-validator",
+            "objective": "Accept S8 validator output.",
+            "status": "completed",
+            "model_lane": "llama.cpp:qwen3.6-27b",
+            "output_contract": {},
+            "parent_acceptance": "accepted",
+            "spot_audit": "Parent checked reports/validator.md.",
+        },
+        session_id="session_worker_merge",
+    )
+    assert json.loads(raw)["success"] is True
+
+    latest = _worker_payloads(run)[-1]
+    assert latest["worker_id"] == "s8-runtime-validator"
+    assert latest["parent_acceptance"] == "accepted"
+    assert latest["output_contract"] == {
+        "expected_artifact": "reports/validator.md",
+        "required_sections": ["verdict"],
+    }
+    assert latest["expected_artifact_paths"] == ["reports/validator.md"]
+    assert latest["artifacts"] == ["reports/validator.md"]
+    assert latest["child_session_id"] == "session_child"
+    assert latest["child_run_id"] == "run_child"
+    assert latest["material_claims"] == [
+        {
+            "statement": "Validator artifact exists.",
+            "refs": ["reports/validator.md"],
+        }
+    ]
+
+    result = write_finalization(
+        objective="Finalize S8 validator output.",
+        verification="Worker contract metadata survived parent acceptance update.",
+        session_id="session_worker_merge",
+    )
+    assert result["verdict"] == "accepted"
+    assert "missing_worker_artifacts" not in result["blockers"]
+
+    status = run_status(session_id="session_worker_merge")
+    assert status["worker_state"]["workers"][0]["output_contract"]["expected_artifact"] == "reports/validator.md"
+    control = write_control_plane_snapshot(
+        session_id="session_worker_merge",
+        next_action="Done.",
+    )
+    control_plane = run.control_plane_path.read_text(encoding="utf-8")
+    assert "child session `session_child`" in control_plane
+    assert 'expected artifacts `["reports/validator.md"]`' in control_plane

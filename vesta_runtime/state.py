@@ -1010,6 +1010,44 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _payload_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_payload_present(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_payload_present(item) for item in value)
+    return True
+
+
+def _latest_worker_entry_for_id(run: VestaRun, worker_id: str) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+    try:
+        entries = _worker_entries(run)
+    except Exception:
+        return latest
+    for entry in entries:
+        if str(entry.get("worker_id") or "") == worker_id:
+            latest = entry
+    return latest
+
+
+def _carry_worker_field(
+    explicit_value: Any,
+    previous: dict[str, Any],
+    field: str,
+    default: Any,
+) -> Any:
+    if _payload_present(explicit_value):
+        return explicit_value
+    previous_value = previous.get(field)
+    if _payload_present(previous_value):
+        return previous_value
+    return default
+
+
 def _redact_secret_string(value: str) -> str:
     redacted = re.sub(
         r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*[^,\s]+",
@@ -1070,20 +1108,58 @@ def record_worker_state(
 
     run = ensure_current_run(session_id=session_id)
     timestamp = _timestamp()
+    resolved_worker_id = worker_id.strip()
+    previous_worker = _latest_worker_entry_for_id(run, resolved_worker_id)
+    resolved_output_contract = _carry_worker_field(
+        output_contract,
+        previous_worker,
+        "output_contract",
+        {},
+    )
+    resolved_child_session_id = _carry_worker_field(
+        child_session_id,
+        previous_worker,
+        "child_session_id",
+        "",
+    )
+    resolved_child_run_id = _carry_worker_field(
+        child_run_id,
+        previous_worker,
+        "child_run_id",
+        "",
+    )
+    resolved_expected_artifact_paths = _carry_worker_field(
+        expected_artifact_paths,
+        previous_worker,
+        "expected_artifact_paths",
+        [],
+    )
+    resolved_artifact_paths = _carry_worker_field(
+        artifact_paths,
+        previous_worker,
+        "artifacts",
+        [],
+    )
+    resolved_material_claims = _carry_worker_field(
+        material_claims,
+        previous_worker,
+        "material_claims",
+        [],
+    )
     safe_payload = _sanitize_runtime_payload({
-        "worker_id": worker_id.strip(),
+        "worker_id": resolved_worker_id,
         "parent_run_id": run.run_id,
-        "child_session_id": child_session_id.strip(),
-        "child_run_id": child_run_id.strip(),
+        "child_session_id": str(resolved_child_session_id).strip(),
+        "child_run_id": str(resolved_child_run_id).strip(),
         "objective": objective.strip(),
-        "output_contract": output_contract or {},
+        "output_contract": resolved_output_contract,
         "model_lane": model_lane.strip(),
         "status": status,
-        "expected_artifact_paths": expected_artifact_paths or [],
-        "artifacts": artifact_paths or [],
+        "expected_artifact_paths": _as_list(resolved_expected_artifact_paths),
+        "artifacts": _as_list(resolved_artifact_paths),
         "failures": failures or [],
         "gaps": gaps or [],
-        "material_claims": material_claims or [],
+        "material_claims": _as_list(resolved_material_claims),
         "parent_acceptance": parent_acceptance,
         "spot_audit": spot_audit.strip(),
         "next_action": next_action.strip(),
@@ -1115,9 +1191,9 @@ def record_worker_state(
 
     append_ledger_entry(
         entry_type="worker_state",
-        title=f"Worker {worker_id.strip()} {status}",
-        statement=f"Worker `{worker_id.strip()}` recorded with status `{status}`.",
-        refs=[str(run.worker_state_path), *[str(path) for path in (artifact_paths or [])]],
+        title=f"Worker {resolved_worker_id} {status}",
+        statement=f"Worker `{resolved_worker_id}` recorded with status `{status}`.",
+        refs=[str(run.worker_state_path), *[str(path) for path in safe_payload["artifacts"]]],
         status=status,
         materiality="high" if status in {"failed", "truncated", "cancelled", "rejected"} else "medium",
         next_action=next_action or None,
