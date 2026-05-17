@@ -261,6 +261,48 @@ def _expected_artifact_paths(
     return unique
 
 
+def _vesta_eval_mode_enabled() -> bool:
+    try:
+        from vesta_runtime import eval_mode_enabled
+
+        return bool(eval_mode_enabled())
+    except Exception:
+        return False
+
+
+def _vesta_eval_delegate_toolsets() -> List[str]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    vesta = cfg.get("vesta", {}) if isinstance(cfg, dict) else {}
+    eval_cfg = vesta.get("eval", {}) if isinstance(vesta, dict) else {}
+    configured = eval_cfg.get("delegate_contract_toolsets") if isinstance(eval_cfg, dict) else None
+    toolsets = _as_string_list(configured)
+    return toolsets or ["file"]
+
+
+def _has_explicit_worker_contract(task: Dict[str, Any]) -> bool:
+    return bool(
+        str(task.get("worker_id") or "").strip()
+        or _as_string_list(task.get("_vesta_expected_artifact_paths"))
+        or _as_string_list(task.get("expected_artifact_paths"))
+        or _as_dict(task.get("_vesta_output_contract"))
+        or _as_dict(task.get("output_contract"))
+    )
+
+
+def _apply_vesta_eval_delegate_defaults(task: Dict[str, Any], inherited_toolsets: Any) -> None:
+    if task.get("toolsets") or inherited_toolsets:
+        return
+    if not _vesta_eval_mode_enabled() or not _has_explicit_worker_contract(task):
+        return
+    task["toolsets"] = _vesta_eval_delegate_toolsets()
+    task["_vesta_default_toolsets_applied"] = True
+
+
 def _child_session_id(child) -> str:
     value = getattr(child, "session_id", "")
     return value if isinstance(value, str) else ""
@@ -2214,6 +2256,7 @@ def delegate_task(
             task_contract,
             explicit_expected_paths,
         )
+        _apply_vesta_eval_delegate_defaults(task, toolsets)
         _record_vesta_worker_boundary(
             task=task,
             status="requested",
@@ -2918,6 +2961,42 @@ def _build_dynamic_schema_overrides() -> dict:
     }
 
 
+_OUTPUT_CONTRACT_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Optional delegated output contract. Use non-empty keys when the "
+        "worker has a stable worker_id or expected_artifact_paths."
+    ),
+    "properties": {
+        "expected_artifact": {
+            "type": "string",
+            "description": "Single expected artifact path, when the worker should produce one.",
+        },
+        "expected_artifacts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Expected artifact paths, when the worker should produce multiple artifacts.",
+        },
+        "required_sections": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Required report or artifact sections.",
+        },
+        "acceptance_checks": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Checks the parent should run before accepting the worker output.",
+        },
+        "success_criteria": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Observable success criteria for this worker.",
+        },
+    },
+    "additionalProperties": True,
+}
+
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     # NOTE: description / tasks.description / role.description are placeholder
@@ -3002,8 +3081,7 @@ DELEGATE_TASK_SCHEMA = {
                             "description": "Optional stable Vesta worker id. Runtime generates one if omitted.",
                         },
                         "output_contract": {
-                            "type": "object",
-                            "description": "Optional delegated output contract. Stored as runtime state without prose inference.",
+                            **_OUTPUT_CONTRACT_SCHEMA,
                         },
                         "expected_artifact_paths": {
                             "type": "array",
@@ -3050,8 +3128,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "Optional stable Vesta worker id for single-task delegation. Runtime generates one if omitted.",
             },
             "output_contract": {
-                "type": "object",
-                "description": "Optional delegated output contract. Stored as runtime state without prose inference.",
+                **_OUTPUT_CONTRACT_SCHEMA,
             },
             "expected_artifact_paths": {
                 "type": "array",

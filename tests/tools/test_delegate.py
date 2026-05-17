@@ -69,6 +69,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("expected_artifact", props["output_contract"]["properties"])
+        self.assertIn("acceptance_checks", props["output_contract"]["properties"])
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
@@ -1813,6 +1815,97 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(kwargs["output_contract"], {"expected_artifact": "reports/validator.md"})
         self.assertEqual(kwargs["expected_artifact_paths"], ["reports/validator.md"])
         self.assertIs(kwargs["parent_agent"], parent)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_eval_worker_contract_defaults_to_narrow_toolsets(self, mock_creds, mock_cfg):
+        """Eval contract workers should not inherit the whole parent tool surface."""
+        mock_creds.return_value = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["hermes-cli", "vesta"]
+        old_source = os.environ.get("HERMES_SESSION_SOURCE")
+        os.environ["HERMES_SESSION_SOURCE"] = "eval"
+        try:
+            with patch("tools.delegate_tool._build_child_agent") as mock_build:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "done",
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+                mock_child._delegate_saved_tool_names = []
+                mock_child._credential_pool = None
+                mock_child.session_prompt_tokens = 0
+                mock_child.session_completion_tokens = 0
+                mock_child.model = "test"
+                mock_build.return_value = mock_child
+
+                delegate_task(
+                    goal="Validate artifact.",
+                    worker_id="s8-runtime-validator",
+                    expected_artifact_paths=["reports/validator.md"],
+                    parent_agent=parent,
+                )
+
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["toolsets"], ["file"])
+        finally:
+            if old_source is None:
+                os.environ.pop("HERMES_SESSION_SOURCE", None)
+            else:
+                os.environ["HERMES_SESSION_SOURCE"] = old_source
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_explicit_toolsets_override_eval_worker_contract_default(self, mock_creds, mock_cfg):
+        mock_creds.return_value = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        old_source = os.environ.get("HERMES_SESSION_SOURCE")
+        os.environ["HERMES_SESSION_SOURCE"] = "eval"
+        try:
+            with patch("tools.delegate_tool._build_child_agent") as mock_build:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "done",
+                    "completed": True,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+                mock_child._delegate_saved_tool_names = []
+                mock_child._credential_pool = None
+                mock_child.session_prompt_tokens = 0
+                mock_child.session_completion_tokens = 0
+                mock_child.model = "test"
+                mock_build.return_value = mock_child
+
+                delegate_task(
+                    goal="Validate artifact.",
+                    toolsets=["file", "vesta"],
+                    worker_id="s8-runtime-validator",
+                    expected_artifact_paths=["reports/validator.md"],
+                    parent_agent=parent,
+                )
+
+            _, kwargs = mock_build.call_args
+            self.assertEqual(kwargs["toolsets"], ["file", "vesta"])
+        finally:
+            if old_source is None:
+                os.environ.pop("HERMES_SESSION_SOURCE", None)
+            else:
+                os.environ["HERMES_SESSION_SOURCE"] = old_source
 
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")

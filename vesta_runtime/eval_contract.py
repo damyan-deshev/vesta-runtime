@@ -65,6 +65,18 @@ _SIMULATION_RE = re.compile(
     re.IGNORECASE,
 )
 STATE_SIMULATION_TOOL_NAMES = {"terminal", "code_execution", "execute_code"}
+DELEGATE_OUTPUT_CONTRACT_REQUIRED_KEYS = {
+    "expected_artifact",
+    "expected_artifacts",
+    "artifact_path",
+    "artifact_paths",
+    "required_sections",
+    "acceptance_checks",
+    "success_criteria",
+    "expected_output",
+    "deliverable",
+    "verification",
+}
 REFUSAL_MARKERS = (
     "refuse",
     "refused",
@@ -278,6 +290,69 @@ def _tool_events(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return events
 
 
+def _value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set)):
+        return any(_value_present(item) for item in value)
+    if isinstance(value, dict):
+        return any(_value_present(item) for item in value.values())
+    return True
+
+
+def _output_contract_has_required_key(contract: Any) -> bool:
+    if not isinstance(contract, dict):
+        return False
+    for key in DELEGATE_OUTPUT_CONTRACT_REQUIRED_KEYS:
+        if _value_present(contract.get(key)):
+            return True
+    return False
+
+
+def _delegate_payloads(args: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tasks = args.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        payloads: list[tuple[str, dict[str, Any]]] = []
+        for index, task in enumerate(tasks):
+            if isinstance(task, dict):
+                payloads.append((f"tasks[{index}]", task))
+        return payloads
+    return [("top_level", args)]
+
+
+def _delegate_requires_output_contract(payload: dict[str, Any]) -> bool:
+    return bool(
+        str(payload.get("worker_id") or "").strip()
+        or _value_present(payload.get("expected_artifact_paths"))
+        or _value_present(payload.get("expected_artifact_path"))
+    )
+
+
+def _delegate_output_contract_failures(events: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    for event in events:
+        if event.get("name") != "delegate_task":
+            continue
+        args = event.get("args") or {}
+        if not isinstance(args, dict):
+            continue
+        for label, payload in _delegate_payloads(args):
+            if not _delegate_requires_output_contract(payload):
+                continue
+            if _output_contract_has_required_key(payload.get("output_contract")):
+                continue
+            worker_id = str(payload.get("worker_id") or "").strip() or label
+            failures.append(
+                "Delegate task with explicit worker contract metadata has empty or incomplete "
+                f"output_contract for `{worker_id}`. Provide one of: "
+                + ", ".join(sorted(DELEGATE_OUTPUT_CONTRACT_REQUIRED_KEYS))
+                + "."
+            )
+    return failures
+
+
 def _missing_order(events: list[dict[str, Any]], required_order: tuple[str, ...]) -> list[str]:
     labels = [event["label"] for event in events]
     missing: list[str] = []
@@ -383,6 +458,7 @@ def enforce_eval_contract(
     )
     simulations = _terminal_simulations(events)
     forbidden_args = forbidden_arg_violations(events)
+    delegate_contract_failures = _delegate_output_contract_failures(events)
     finalization_status = _finalization_status(run)
 
     failures: list[str] = []
@@ -402,6 +478,7 @@ def enforce_eval_contract(
             "Eval scenario used forbidden tool arguments: "
             + ", ".join(forbidden_args)
         )
+    failures.extend(delegate_contract_failures)
     if _final_response_claims_success(final_response) and finalization_status not in {
         "accepted",
         "accepted_with_gaps",
@@ -450,6 +527,7 @@ def enforce_eval_contract(
         "missing_order": missing,
         "terminal_simulations": simulations,
         "forbidden_tool_args": forbidden_args,
+        "delegate_contract_failures": delegate_contract_failures,
         "contract_profile": contract_profile,
         "finalization_path": result["finalization_path"],
         "control_plane_path": control["control_plane_path"],

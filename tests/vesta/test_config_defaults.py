@@ -21,6 +21,7 @@ def test_vesta_defaults_are_first_class_config():
     assert DEFAULT_CONFIG["vesta"]["eval"]["read_only_fixture_paths"] == []
     assert DEFAULT_CONFIG["vesta"]["eval"]["forbidden_write_paths"] == []
     assert DEFAULT_CONFIG["vesta"]["eval"]["forbidden_tool_args"] == []
+    assert DEFAULT_CONFIG["vesta"]["eval"]["delegate_contract_toolsets"] == ["file"]
 
 
 def test_vesta_config_deep_merges_partial_user_override():
@@ -40,3 +41,4 @@ def test_vesta_config_deep_merges_partial_user_override():
     assert cfg["vesta"]["raw_retention"]["retain_by_default"] is True
     assert cfg["vesta"]["eval"]["allow_background_review"] is False
     assert cfg["vesta"]["eval"]["contract_profile"] == "artifact_positive"
+    assert cfg["vesta"]["eval"]["delegate_contract_toolsets"] == ["file"]

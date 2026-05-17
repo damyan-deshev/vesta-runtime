@@ -289,6 +289,139 @@ def test_eval_contract_blocks_forbidden_override_args(tmp_path, monkeypatch):
     assert "forbidden tool arguments" in run.finalization_path.read_text(encoding="utf-8")
 
 
+def test_eval_contract_blocks_empty_delegate_output_contract_for_worker_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_delegate_contract",
+        workspace_path=tmp_path,
+        run_id="run_eval_delegate_contract",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "report.md"
+    validator_artifact = tmp_path / "live-eval-artifacts" / "validator.md"
+    seed_eval_contract_from_prompt(
+        prompt=f"artifact_record ledger_append finalize_run {artifact}",
+        session_id="session_eval_delegate_contract",
+    )
+    artifact.parent.mkdir()
+    artifact.write_text("report", encoding="utf-8")
+    validator_artifact.write_text("validator", encoding="utf-8")
+    record_artifact(
+        path=str(artifact),
+        artifact_type="eval_artifact",
+        expected_by="model_contract",
+        status="exists",
+        session_id="session_eval_delegate_contract",
+    )
+    append_ledger_entry(
+        entry_type="verification",
+        title="Artifact verified",
+        statement="Artifact exists.",
+        status="accepted",
+        materiality="medium",
+        session_id="session_eval_delegate_contract",
+    )
+    write_finalization(
+        objective="Run eval.",
+        verification="Artifact exists.",
+        session_id="session_eval_delegate_contract",
+    )
+    messages = [
+        _tool_call("artifact_record", {"path": str(artifact), "status": "expected"}),
+        _tool_call(
+            "delegate_task",
+            {
+                "goal": "Validate report.",
+                "worker_id": "s8-runtime-validator",
+                "expected_artifact_paths": [str(validator_artifact)],
+                "output_contract": {},
+            },
+        ),
+        _tool_call("write_file", {"path": str(artifact), "content": "report"}),
+        _tool_call("artifact_record", {"path": str(artifact), "status": "exists"}),
+        _tool_call("ledger_append", {"entry_type": "verification"}),
+        _tool_call("finalize_run", {"objective": "Run eval.", "verification": "Artifact exists."}),
+    ]
+
+    result = enforce_eval_contract(
+        messages=messages,
+        final_response=f"Finalization verdict: accepted; report path: {artifact}",
+        objective="Run eval.",
+        session_id="session_eval_delegate_contract",
+    )
+
+    assert result["compliant"] is False
+    assert result["verdict"] == "blocked"
+    assert result["delegate_contract_failures"]
+    assert "s8-runtime-validator" in result["delegate_contract_failures"][0]
+    assert "empty or incomplete output_contract" in run.finalization_path.read_text(encoding="utf-8")
+
+
+def test_eval_contract_accepts_delegate_output_contract_with_expected_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_delegate_contract_ok",
+        workspace_path=tmp_path,
+        run_id="run_eval_delegate_contract_ok",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "report.md"
+    validator_artifact = tmp_path / "live-eval-artifacts" / "validator.md"
+    seed_eval_contract_from_prompt(
+        prompt=f"artifact_record ledger_append finalize_run {artifact}",
+        session_id="session_eval_delegate_contract_ok",
+    )
+    artifact.parent.mkdir()
+    artifact.write_text("report", encoding="utf-8")
+    validator_artifact.write_text("validator", encoding="utf-8")
+    record_artifact(
+        path=str(artifact),
+        artifact_type="eval_artifact",
+        expected_by="model_contract",
+        status="exists",
+        session_id="session_eval_delegate_contract_ok",
+    )
+    append_ledger_entry(
+        entry_type="verification",
+        title="Artifact verified",
+        statement="Artifact exists.",
+        status="accepted",
+        materiality="medium",
+        session_id="session_eval_delegate_contract_ok",
+    )
+    write_finalization(
+        objective="Run eval.",
+        verification="Artifact exists.",
+        session_id="session_eval_delegate_contract_ok",
+    )
+    messages = [
+        _tool_call("artifact_record", {"path": str(artifact), "status": "expected"}),
+        _tool_call(
+            "delegate_task",
+            {
+                "goal": "Validate report.",
+                "worker_id": "s8-runtime-validator",
+                "expected_artifact_paths": [str(validator_artifact)],
+                "output_contract": {"expected_artifact": str(validator_artifact)},
+            },
+        ),
+        _tool_call("write_file", {"path": str(artifact), "content": "report"}),
+        _tool_call("artifact_record", {"path": str(artifact), "status": "exists"}),
+        _tool_call("ledger_append", {"entry_type": "verification"}),
+        _tool_call("finalize_run", {"objective": "Run eval.", "verification": "Artifact exists."}),
+    ]
+
+    result = enforce_eval_contract(
+        messages=messages,
+        final_response=f"Finalization verdict: accepted; report path: {artifact}",
+        objective="Run eval.",
+        session_id="session_eval_delegate_contract_ok",
+    )
+
+    assert result["compliant"] is True
+    assert result["finalization_status"] == "accepted"
+
+
 def test_refusal_mentioning_pass_is_not_success_claim(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
     set_current_run(None)

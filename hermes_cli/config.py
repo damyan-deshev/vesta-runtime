@@ -765,6 +765,7 @@ DEFAULT_CONFIG = {
             "read_only_fixture_paths": [],
             "forbidden_write_paths": [],
             "forbidden_tool_args": [],
+            "delegate_contract_toolsets": ["file"],
         },
     },
 
