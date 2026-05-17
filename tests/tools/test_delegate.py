@@ -144,6 +144,47 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_can_include_vesta_retrieval_contract(self):
+        with patch(
+            "vesta_runtime.retrieval.build_retrieval_prompt_contract",
+            return_value="Vesta retrieval discipline:\n- locator first",
+        ):
+            prompt = _build_child_system_prompt(
+                "Inspect source",
+                include_vesta_retrieval_contract=True,
+            )
+
+        self.assertIn("Vesta retrieval discipline", prompt)
+        self.assertIn("locator first", prompt)
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_file_tool_children_receive_vesta_retrieval_contract(self, mock_cfg):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["file"]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "vesta_runtime.retrieval.build_retrieval_prompt_contract",
+                return_value="Vesta retrieval discipline:\n- locator first",
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect source",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        prompt = MockAgent.call_args[1]["ephemeral_system_prompt"]
+        self.assertIn("Vesta retrieval discipline", prompt)
+        self.assertIn("locator first", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

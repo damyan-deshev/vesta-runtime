@@ -6238,6 +6238,16 @@ class AIAgent:
         if tool_guidance:
             stable_parts.append(" ".join(tool_guidance))
 
+        if {"read_file", "search_files"}.issubset(self.valid_tool_names):
+            try:
+                from vesta_runtime.retrieval import build_retrieval_prompt_contract
+
+                retrieval_contract = build_retrieval_prompt_contract()
+            except Exception:
+                retrieval_contract = ""
+            if retrieval_contract:
+                stable_parts.append(retrieval_contract)
+
         # Computer-use (macOS) — goes in as its own block rather than being
         # merged into tool_guidance because the content is multi-paragraph.
         if "computer_use" in self.valid_tool_names:

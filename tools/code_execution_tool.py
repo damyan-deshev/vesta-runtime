@@ -196,9 +196,9 @@ _TOOL_STUBS = {
     ),
     "read_file": (
         "read_file",
-        "path: str, offset: int = 1, limit: int = 500",
-        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines"."""',
-        '{"path": path, "offset": offset, "limit": limit}',
+        "path: str, offset: int = 1, limit: int = 180, complete_coverage: bool = False, broad_read_reason: str = None",
+        '"""Read a file (1-indexed lines). Returns dict with "content" and "total_lines". For deliberate broad reads, pass complete_coverage=True or broad_read_reason."""',
+        '{"path": path, "offset": offset, "limit": limit, "complete_coverage": complete_coverage, "broad_read_reason": broad_read_reason}',
     ),
     "write_file": (
         "write_file",
@@ -1653,8 +1653,8 @@ _TOOL_DOC_LINES = [
      "  web_extract(urls: list[str]) -> dict\n"
      "    Returns {\"results\": [{\"url\", \"title\", \"content\", \"error\"}, ...]} where content is markdown"),
     ("read_file",
-     "  read_file(path: str, offset: int = 1, limit: int = 500) -> dict\n"
-     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}"),
+     "  read_file(path: str, offset: int = 1, limit: int = 180, complete_coverage: bool = False, broad_read_reason: str = None) -> dict\n"
+     "    Lines are 1-indexed. Returns {\"content\": \"...\", \"total_lines\": N}. Deliberate broad reads need complete_coverage or broad_read_reason."),
     ("write_file",
      "  write_file(path: str, content: str) -> dict\n"
      "    Always overwrites the entire file."),

@@ -14,6 +14,7 @@ import os
 
 
 DEFAULT_MODE = "disciplined"
+DEFAULT_READ_FILE_LINE_LIMIT = 180
 DEFAULT_BROAD_READ_LINE_THRESHOLD = 200
 DEFAULT_BROAD_READ_BYTE_THRESHOLD = 20_000
 DEFAULT_BROAD_READ_TOKEN_THRESHOLD = 12_000
@@ -29,6 +30,22 @@ class RetrievalConfig:
     broad_read_line_threshold: int = DEFAULT_BROAD_READ_LINE_THRESHOLD
     broad_read_byte_threshold: int = DEFAULT_BROAD_READ_BYTE_THRESHOLD
     broad_read_token_threshold: int = DEFAULT_BROAD_READ_TOKEN_THRESHOLD
+
+
+def build_retrieval_prompt_contract() -> str:
+    """Return the stable prompt block for Vesta locator-first retrieval."""
+
+    cfg = load_retrieval_config()
+    if cfg.mode != "disciplined":
+        return ""
+    narrow_limit = min(DEFAULT_READ_FILE_LINE_LIMIT, cfg.broad_read_line_threshold)
+    return (
+        "Vesta retrieval discipline:\n"
+        "- For unfamiliar source files, locate before reading with search_files or a manifest/count tool.\n"
+        f"- Prefer narrow read_file windows, normally <= {narrow_limit} lines.\n"
+        "- Do not broad-read by default; broad reads require complete_coverage=true or a short broad_read_reason.\n"
+        "- When Vesta state tools are available, use them before reading raw ledger/control/finalization files."
+    )
 
 
 def _as_int(value: Any, default: int) -> int:

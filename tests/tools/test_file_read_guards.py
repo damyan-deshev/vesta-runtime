@@ -555,7 +555,7 @@ class TestLargeFileHint(unittest.TestCase):
         fake.read_file = patched_read
         mock_ops.return_value = fake
 
-        result = json.loads(read_file_tool("/tmp/bigfile.log", task_id="hint"))
+        result = json.loads(read_file_tool("/tmp/bigfile.log", limit=500, task_id="hint"))
         self.assertIn("_hint", result)
         self.assertIn("section you need", result["_hint"])
 

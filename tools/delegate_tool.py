@@ -31,7 +31,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from toolsets import TOOLSETS
+from toolsets import TOOLSETS, resolve_toolset
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -767,6 +767,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    include_vesta_retrieval_contract: bool = False,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -801,6 +802,15 @@ def _build_child_system_prompt(
         "Be thorough but concise -- your response is returned to the "
         "parent agent as a summary."
     )
+    if include_vesta_retrieval_contract:
+        try:
+            from vesta_runtime.retrieval import build_retrieval_prompt_contract
+
+            retrieval_contract = build_retrieval_prompt_contract()
+        except Exception:
+            retrieval_contract = ""
+        if retrieval_contract:
+            parts.append("\n" + retrieval_contract)
     if role == "orchestrator":
         child_note = (
             "Your own children MUST be leaves (cannot delegate further) "
@@ -833,6 +843,17 @@ def _build_child_system_prompt(
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
     return "\n".join(parts)
+
+
+def _toolsets_include_read_tools(toolsets: List[str]) -> bool:
+    for name in toolsets:
+        try:
+            resolved = set(resolve_toolset(name))
+        except Exception:
+            resolved = set(TOOLSETS.get(name, {}).get("tools", []))
+        if {"read_file", "search_files"}.issubset(resolved):
+            return True
+    return False
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -1168,6 +1189,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        include_vesta_retrieval_contract=_toolsets_include_read_tools(child_toolsets),
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)

@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 
-from tools.file_tools import read_file_tool, search_tool
+from tools.file_tools import READ_FILE_SCHEMA, read_file_tool, search_tool
 from vesta_runtime import create_run, set_current_run
 from vesta_runtime.retrieval import reset_locator_history
 
@@ -23,6 +23,23 @@ def test_disciplined_mode_blocks_unjustified_broad_read(tmp_path):
     assert "Vesta retrieval policy blocked" in result["error"]
     assert result["vesta_retrieval_policy"]["mode"] == "disciplined"
     assert "Run search_files first to locate relevant sections." in result["vesta_retrieval_policy"]["repair"]
+
+
+def test_disciplined_mode_default_read_limit_stays_below_broad_threshold(tmp_path):
+    set_current_run(None)
+    reset_locator_history()
+    create_run(session_id="session_retrieval", workspace_path=tmp_path, run_id="run_retrieval_default")
+    target = tmp_path / "large.txt"
+    _write_lines(target, 300)
+
+    result = json.loads(read_file_tool(str(target), task_id="task_default"))
+
+    assert "error" not in result
+    assert result["total_lines"] == 300
+    assert result["truncated"] is True
+    assert "showing 1-180 of 300 lines" in result["hint"]
+    assert "_vesta_retrieval" not in result
+    assert READ_FILE_SCHEMA["parameters"]["properties"]["limit"]["default"] == 180
 
 
 def test_disciplined_mode_allows_broad_read_after_locator(tmp_path):

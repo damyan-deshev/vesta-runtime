@@ -11,6 +11,7 @@ from pathlib import Path
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
+    DEFAULT_READ_LIMIT,
     ShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -478,7 +479,7 @@ def _vesta_retrieval_policy_applies(resolved_path: str) -> bool:
 def read_file_tool(
     path: str,
     offset: int = 1,
-    limit: int = 500,
+    limit: int = DEFAULT_READ_LIMIT,
     task_id: str = "default",
     complete_coverage: bool = False,
     broad_read_reason: str | None = None,
@@ -1151,7 +1152,7 @@ READ_FILE_SCHEMA = {
         "properties": {
             "path": {"type": "string", "description": "Path to the file to read (absolute, relative, or ~/path)"},
             "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed, default: 1)", "default": 1, "minimum": 1},
-            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 500, max: 2000)", "default": 500, "maximum": 2000},
+            "limit": {"type": "integer", "description": "Maximum number of lines to read (default: 180, max: 2000)", "default": DEFAULT_READ_LIMIT, "maximum": 2000},
             "complete_coverage": {"type": "boolean", "description": "Set true only when the task requires complete document/file coverage rather than locator-first source retrieval.", "default": False},
             "broad_read_reason": {"type": "string", "description": "Short reason for a deliberate broad read when locator-first retrieval is insufficient."}
         },
@@ -1243,7 +1244,7 @@ def _handle_read_file(args, **kw):
     return read_file_tool(
         path=args.get("path", ""),
         offset=args.get("offset", 1),
-        limit=args.get("limit", 500),
+        limit=args.get("limit", DEFAULT_READ_LIMIT),
         task_id=tid,
         complete_coverage=bool(args.get("complete_coverage", False)),
         broad_read_reason=args.get("broad_read_reason") or None,
