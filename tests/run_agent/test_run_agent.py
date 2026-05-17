@@ -2476,6 +2476,58 @@ class TestHandleMaxIterations:
         assert messages[-1]["content"] == result
         agent.client.chat.completions.create.assert_not_called()
 
+    def test_vesta_eval_max_iterations_preserves_accepted_control_plane(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        agent._cached_system_prompt = "You are helpful."
+        agent.max_iterations = 45
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "tool",
+                "name": "control_plane_snapshot",
+                "content": json.dumps({
+                    "success": True,
+                    "finalization_status": "accepted",
+                    "run_id": "run_ok",
+                }),
+                "tool_call_id": "call_control",
+            },
+        ]
+
+        result = agent._handle_max_iterations(messages, 45)
+
+        assert "after Vesta state was accepted" in result
+        assert "`control_plane_snapshot`" in result
+        assert "before the Vesta eval contract was fully satisfied" not in result
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"] == result
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_vesta_eval_max_iterations_preserves_accepted_finalization(self, agent, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+        agent._cached_system_prompt = "You are helpful."
+        agent.max_iterations = 45
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "tool",
+                "name": "finalize_run",
+                "content": json.dumps({
+                    "success": True,
+                    "verdict": "accepted_with_gaps",
+                    "run_id": "run_ok",
+                }),
+                "tool_call_id": "call_finalize",
+            },
+        ]
+
+        result = agent._handle_max_iterations(messages, 45)
+
+        assert "after Vesta state was accepted" in result
+        assert "`finalize_run`" in result
+        assert "incomplete" not in result
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_returns_summary(self, agent):
         resp = _mock_response(content="Here is a summary of what I did.")
         agent.client.chat.completions.create.return_value = resp

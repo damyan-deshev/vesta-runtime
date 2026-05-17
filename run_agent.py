@@ -12113,12 +12113,53 @@ class AIAgent:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+    @staticmethod
+    def _accepted_vesta_state_from_messages(messages: list) -> str | None:
+        """Return the Vesta state tool that proves an eval run already accepted."""
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            name = msg.get("name")
+            if name not in {"control_plane_snapshot", "finalize_run"}:
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or payload.get("success") is not True:
+                continue
+            if name == "control_plane_snapshot":
+                status = payload.get("finalization_status")
+                if status in {"accepted", "accepted_with_gaps"}:
+                    return name
+            else:
+                verdict = payload.get("verdict")
+                if verdict in {"accepted", "accepted_with_gaps"}:
+                    return name
+        return None
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         try:
             from vesta_runtime import eval_mode_enabled as _vesta_eval_mode_enabled
 
             if _vesta_eval_mode_enabled():
+                accepted_state = self._accepted_vesta_state_from_messages(messages)
+                if accepted_state:
+                    final_response = (
+                        f"Reached maximum iterations ({self.max_iterations}) after "
+                        f"Vesta state was accepted by `{accepted_state}`. No extra "
+                        "summary call was made; typed Vesta state is authoritative."
+                    )
+                    print(
+                        f"⚠️  Reached maximum iterations ({self.max_iterations}) "
+                        f"after accepted Vesta state ({accepted_state}). Ending eval without summary call."
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    return final_response
                 final_response = (
                     f"Reached maximum iterations ({self.max_iterations}) before the "
                     "Vesta eval contract was fully satisfied. Treat this eval run as "
