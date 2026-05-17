@@ -82,4 +82,6 @@ work/vesta-runtime/t[0-9]*-vesta-*.md
 work/vesta-runtime/vesta-eval-*.md
 work/vesta-runtime/vesta-live-*.md
 work/vesta-runtime/vesta-next-live-suite-plan-*.md
+work/vesta-runtime/post-*-live-evidence-*.md
+work/vesta-runtime/post-*-s*-*.md
 work/vesta-runtime/scratch/

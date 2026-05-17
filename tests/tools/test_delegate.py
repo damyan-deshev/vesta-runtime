@@ -1790,6 +1790,30 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
+    def test_vesta_worker_fields_forwarded_by_agent_dispatch(self):
+        """Agent dispatch must preserve Vesta worker contract metadata."""
+        from run_agent import AIAgent
+
+        parent = _make_mock_parent(depth=0)
+        args = {
+            "goal": "Run validator worker.",
+            "context": "Focused S8 proof.",
+            "toolsets": ["file", "vesta"],
+            "worker_id": "s8-runtime-validator",
+            "output_contract": {"expected_artifact": "reports/validator.md"},
+            "expected_artifact_paths": ["reports/validator.md"],
+        }
+
+        with patch("tools.delegate_tool.delegate_task", return_value='{"success": true}') as mock_delegate:
+            result = AIAgent._dispatch_delegate_task(parent, args)
+
+        self.assertEqual(result, '{"success": true}')
+        _, kwargs = mock_delegate.call_args
+        self.assertEqual(kwargs["worker_id"], "s8-runtime-validator")
+        self.assertEqual(kwargs["output_contract"], {"expected_artifact": "reports/validator.md"})
+        self.assertEqual(kwargs["expected_artifact_paths"], ["reports/validator.md"])
+        self.assertIs(kwargs["parent_agent"], parent)
+
     @patch("tools.delegate_tool._load_config", return_value={})
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_acp_args_forwarded(self, mock_creds, mock_cfg):

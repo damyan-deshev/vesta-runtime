@@ -11051,6 +11051,9 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            worker_id=function_args.get("worker_id"),
+            output_contract=function_args.get("output_contract"),
+            expected_artifact_paths=function_args.get("expected_artifact_paths"),
             parent_agent=self,
         )
 
