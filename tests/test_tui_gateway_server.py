@@ -2013,6 +2013,52 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_emits_turn_status_lifecycle(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            stream_callback("hello")
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    emits: list[tuple] = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping status"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp["result"]["status"] == "streaming"
+    turn_events = [args for args in emits if args[0] == "turn.status"]
+    assert turn_events, "prompt.submit should emit inspectable turn state"
+    assert turn_events[0][2]["running"] is True
+    assert turn_events[0][2]["prompt_preview"] == "ping status"
+    assert any(event[2].get("last_event") == "model_call" for event in turn_events)
+    assert turn_events[-1][2]["running"] is False
+    assert turn_events[-1][2]["status"] == "complete"
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 
@@ -2232,6 +2278,39 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     assert "Tokens: 1,234" in out
     assert "Agent Running: Yes" in out
     assert "Vesta Run: none" in out
+
+
+def test_session_status_includes_running_turn_metadata(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="live-model",
+        provider="live-provider",
+        session_total_tokens=1234,
+    )
+    session = _session(agent=agent, running=True)
+    now = time.time()
+    session.update(
+        {
+            "turn_started_at": now - 65,
+            "turn_last_event_at": now - 5,
+            "turn_last_event": "model_call",
+            "turn_prompt_preview": "Refactor the copied helper.",
+        }
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    out = resp["result"]["output"]
+    assert "Agent Running: Yes" in out
+    assert "Current Turn: running for" in out
+    assert "Turn Last Event: model_call" in out
+    assert "Turn Prompt: Refactor the copied helper." in out
 
 
 def test_session_status_includes_active_vesta_run(tmp_path, monkeypatch):
@@ -2914,6 +2993,40 @@ def test_interrupt_clears_multiple_own_pending():
         for key in ("r1", "r2"):
             server._pending.pop(key, None)
             server._answers.pop(key, None)
+
+
+def test_interrupt_marks_turn_status_for_ui():
+    calls = {"interrupts": 0}
+
+    sess = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: calls.__setitem__("interrupts", calls["interrupts"] + 1)
+        ),
+        running=True,
+    )
+    server._start_turn_state(sess, "long local model call")
+    server._sessions["sid"] = sess
+    emits: list[tuple] = []
+
+    try:
+        with patch("tui_gateway.server._emit", lambda *args: emits.append(args)):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.interrupt",
+                    "params": {"session_id": "sid"},
+                }
+            )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert resp.get("result")
+    assert calls["interrupts"] == 1
+    assert sess["turn_interrupt_requested"] is True
+    turn_events = [args for args in emits if args[0] == "turn.status"]
+    assert turn_events
+    assert turn_events[-1][2]["interrupt_requested"] is True
+    assert turn_events[-1][2]["last_event"] == "interrupt_requested"
 
 
 def test_clear_pending_without_sid_clears_all():

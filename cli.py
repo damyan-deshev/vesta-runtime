@@ -533,13 +533,20 @@ def load_cli_config() -> Dict[str, Any]:
     }
     
     # Bridge config → env vars for terminal_tool. TERMINAL_CWD is force-exported
-    # UNLESS we're inside a gateway process (detected by _HERMES_GATEWAY marker)
-    # where it was already set correctly by gateway/run.py's config bridge.
-    _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    # UNLESS we're inside a gateway/dashboard PTY child where the launcher
+    # already set it correctly.  Dashboard chat can intentionally run from a
+    # copy-workspace while the server process cwd stays on the source checkout.
+    _preserve_existing_terminal_cwd = (
+        os.environ.get("_HERMES_GATEWAY") == "1"
+        or (
+            os.environ.get("HERMES_DASHBOARD_PTY") == "1"
+            and bool(os.environ.get("TERMINAL_CWD"))
+        )
+    )
     for config_key, env_var in env_mappings.items():
         if config_key in terminal_config:
             if env_var == "TERMINAL_CWD":
-                if _is_gateway:
+                if _preserve_existing_terminal_cwd:
                     continue
                 # CLI: always export (overrides stale .env or inherited values)
                 os.environ[env_var] = str(terminal_config[config_key])

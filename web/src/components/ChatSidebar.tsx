@@ -33,7 +33,7 @@ import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 import { api, type VestaSessionStatusResponse } from "@/lib/api";
 
 import { cn } from "@/lib/utils";
-import { AlertCircle, ChevronDown, ClipboardList, RefreshCw } from "lucide-react";
+import { AlertCircle, ChevronDown, ClipboardList, Clock, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 interface SessionInfo {
@@ -47,6 +47,29 @@ interface SessionInfo {
 interface RpcEnvelope {
   method?: string;
   params?: { payload?: unknown; session_id?: string; type?: string };
+}
+
+interface TurnStatusPayload {
+  elapsed_seconds?: number;
+  interrupt_requested?: boolean;
+  last_event?: string;
+  last_event_age_seconds?: number;
+  prompt_preview?: string;
+  running?: boolean;
+  started_at?: number;
+  status?: string;
+  turn_id?: string;
+}
+
+interface TurnState {
+  elapsedSeconds?: number;
+  interruptRequested?: boolean;
+  lastEvent?: string;
+  lastEventAgeSeconds?: number;
+  promptPreview?: string;
+  running: boolean;
+  startedAt?: number;
+  status: string;
 }
 
 const TOOL_LIMIT = 20;
@@ -90,6 +113,14 @@ function shortModelName(model: string | undefined): string {
   return model.split("/").filter(Boolean).slice(-1)[0] ?? model;
 }
 
+function formatElapsed(seconds: number | undefined): string {
+  const value = Math.max(0, Math.round(seconds ?? 0));
+  if (value < 60) return `${value}s`;
+  const minutes = Math.floor(value / 60);
+  const rest = value % 60;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
 function runtimeSessionId(
   payload: SessionInfo | undefined,
   fallback: string | undefined,
@@ -121,6 +152,8 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
   );
   const [info, setInfo] = useState<SessionInfo>({});
   const [tools, setTools] = useState<ToolEntry[]>([]);
+  const [turn, setTurn] = useState<TurnState>({ running: false, status: "idle" });
+  const [now, setNow] = useState(Date.now());
   const [vesta, setVesta] = useState<VestaSessionStatusResponse | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -215,6 +248,15 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
     return () => window.clearInterval(id);
   }, [refreshVesta, observedSessionId]);
 
+  useEffect(() => {
+    if (!turn.running) {
+      return;
+    }
+
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [turn.running]);
+
   // Event subscriber WebSocket — receives the rebroadcast of every
   // dispatcher emit from the PTY child's gateway.  See /api/pub +
   // /api/events in hermes_cli/web_server.py for the broadcast hop.
@@ -279,6 +321,32 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
           setObservedSessionId(runtimeSid);
           refreshVesta(runtimeSid);
         }
+      } else if (type === "message.start") {
+        const startedAt = Date.now();
+        setNow(startedAt);
+        setTurn((prev) => ({
+          ...prev,
+          lastEvent: "model_call_pending",
+          lastEventAgeSeconds: 0,
+          running: true,
+          startedAt,
+          status: "running",
+        }));
+      } else if (type === "turn.status") {
+        const p = payload as TurnStatusPayload | undefined;
+        if (!p) {
+          return;
+        }
+        setTurn({
+          elapsedSeconds: p.elapsed_seconds,
+          interruptRequested: p.interrupt_requested,
+          lastEvent: p.last_event,
+          lastEventAgeSeconds: p.last_event_age_seconds,
+          promptPreview: p.prompt_preview,
+          running: p.running === true,
+          startedAt: p.started_at ? p.started_at * 1000 : undefined,
+          status: p.status ?? (p.running ? "running" : "idle"),
+        });
       } else if (type === "tool.start") {
         const p = payload as
           | { tool_id?: string; name?: string; context?: string }
@@ -289,6 +357,11 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
           return;
         }
 
+        setTurn((prev) =>
+          prev.running
+            ? { ...prev, lastEvent: `tool:${p?.name ?? "tool"}:started`, lastEventAgeSeconds: 0 }
+            : prev,
+        );
         setTools((prev) =>
           [
             ...prev,
@@ -323,6 +396,7 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
         const p = payload as
           | {
               tool_id?: string;
+              name?: string;
               summary?: string;
               error?: string;
               inline_diff?: string;
@@ -333,6 +407,11 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
           return;
         }
 
+        setTurn((prev) =>
+          prev.running
+            ? { ...prev, lastEvent: `tool:${p.name ?? "tool"}:complete`, lastEventAgeSeconds: 0 }
+            : prev,
+        );
         setTools((prev) =>
           prev.map((t) =>
             t.tool_id === p.tool_id
@@ -348,6 +427,25 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
           ),
         );
         refreshVesta();
+      } else if (type === "message.complete") {
+        setTurn((prev) => ({
+          ...prev,
+          elapsedSeconds:
+            prev.startedAt !== undefined ? (Date.now() - prev.startedAt) / 1000 : prev.elapsedSeconds,
+          lastEvent: "message.complete",
+          lastEventAgeSeconds: 0,
+          running: false,
+          status: "complete",
+        }));
+        refreshVesta();
+      } else if (type === "error") {
+        setTurn((prev) => ({
+          ...prev,
+          lastEvent: "error",
+          lastEventAgeSeconds: 0,
+          running: false,
+          status: "error",
+        }));
       }
     });
 
@@ -405,6 +503,12 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
     (vestaRun?.worker_state?.blockers?.length ?? 0) +
     (vestaRun?.validator_blockers?.length ?? 0);
   const finalization = vestaRun?.finalization_status ?? "not_written";
+  const turnElapsed =
+    turn.running && turn.startedAt !== undefined
+      ? (now - turn.startedAt) / 1000
+      : turn.elapsedSeconds;
+  const turnBadge =
+    turn.running ? "running" : turn.status === "idle" ? "idle" : turn.status;
 
   return (
     <aside
@@ -460,6 +564,44 @@ export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSi
           </div>
         </Card>
       )}
+
+      <Card className="flex flex-col gap-2 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <Clock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <div className="truncate text-xs uppercase tracking-wider text-muted-foreground">
+              turn
+            </div>
+          </div>
+
+          <Badge tone={turn.running ? "warning" : "secondary"}>{turnBadge}</Badge>
+        </div>
+
+        {turn.running || turn.status !== "idle" ? (
+          <div className="grid gap-1 text-xs text-muted-foreground">
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>elapsed</span>
+              <span className="font-mono text-foreground">{formatElapsed(turnElapsed)}</span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>last</span>
+              <span className="min-w-0 truncate font-mono text-foreground" title={turn.lastEvent}>
+                {turn.lastEvent ?? "—"}
+              </span>
+            </div>
+            {turn.interruptRequested && (
+              <div className="text-warning">interrupt requested</div>
+            )}
+            {turn.promptPreview && (
+              <div className="line-clamp-2 text-foreground">
+                {turn.promptPreview}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-xs text-muted-foreground">no active turn</div>
+        )}
+      </Card>
 
       <Card className="flex flex-col gap-2 px-3 py-2">
         <div className="flex items-center justify-between gap-2">

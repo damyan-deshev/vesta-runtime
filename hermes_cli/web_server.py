@@ -3303,6 +3303,7 @@ def _resolve_chat_argv(
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
     env.setdefault("NODE_ENV", "production")
+    env["HERMES_DASHBOARD_PTY"] = "1"
     # Browser-embedded chat should prefer stable wheel-based scrollback over
     # native terminal mouse tracking. When mouse tracking is enabled, wheel
     # events are consumed by the TUI and forwarded as terminal input, which
@@ -3324,9 +3325,24 @@ def _resolve_chat_argv(
     # the process cwd. Dashboard chat sometimes needs an explicit embedded-PTY
     # workspace (for example copy-workspace QA), so allow a dashboard-specific
     # override that survives that bridge and forward it to the TUI child.
+    configured_terminal_cwd = ""
+    try:
+        cfg = load_config()
+        terminal_cfg = cfg.get("terminal") if isinstance(cfg, dict) else {}
+        raw_cwd = (
+            terminal_cfg.get("cwd")
+            if isinstance(terminal_cfg, dict)
+            else None
+        )
+        if raw_cwd not in (None, "", "."):
+            configured_terminal_cwd = str(raw_cwd)
+    except Exception:
+        configured_terminal_cwd = ""
+
     terminal_cwd = str(
         os.environ.get("HERMES_DASHBOARD_TERMINAL_CWD")
         or env.get("TERMINAL_CWD")
+        or configured_terminal_cwd
         or ""
     ).strip()
     if terminal_cwd:

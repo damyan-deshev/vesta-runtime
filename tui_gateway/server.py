@@ -1520,6 +1520,95 @@ def _fmt_tool_duration(seconds: float | None) -> str:
     return f"{mins}m {secs}s" if secs else f"{mins}m"
 
 
+def _preview_turn_text(value: Any, limit: int = 160) -> str:
+    if isinstance(value, str):
+        raw = value
+    elif isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        raw = " ".join(parts)
+    else:
+        raw = str(value or "")
+    compact = " ".join(raw.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _mark_turn_event(session: dict | None, event: str) -> None:
+    if session is None:
+        return
+    now = time.time()
+    session["turn_last_event"] = event
+    session["turn_last_event_at"] = now
+
+
+def _start_turn_state(session: dict, text: Any) -> dict:
+    now = time.time()
+    turn_id = uuid.uuid4().hex[:10]
+    session["turn_id"] = turn_id
+    session["turn_started_at"] = now
+    session["turn_last_event_at"] = now
+    session["turn_last_event"] = "queued"
+    session["turn_prompt_preview"] = _preview_turn_text(text)
+    session["turn_interrupt_requested"] = False
+    return _turn_status_payload(session)
+
+
+def _turn_status_payload(
+    session: dict,
+    *,
+    running: bool | None = None,
+    status: str | None = None,
+) -> dict:
+    started_at = session.get("turn_started_at")
+    if not started_at:
+        return {
+            "running": bool(session.get("running")) if running is None else bool(running),
+            "status": status or ("running" if session.get("running") else "idle"),
+        }
+    now = time.time()
+    last_at = float(session.get("turn_last_event_at") or started_at)
+    is_running = bool(session.get("running")) if running is None else bool(running)
+    return {
+        "running": is_running,
+        "status": status or ("running" if is_running else "complete"),
+        "turn_id": session.get("turn_id") or "",
+        "started_at": float(started_at),
+        "elapsed_seconds": max(0.0, now - float(started_at)),
+        "last_event": session.get("turn_last_event") or "unknown",
+        "last_event_age_seconds": max(0.0, now - last_at),
+        "prompt_preview": session.get("turn_prompt_preview") or "",
+        "interrupt_requested": bool(session.get("turn_interrupt_requested")),
+    }
+
+
+def _emit_turn_status(
+    sid: str,
+    session: dict,
+    *,
+    running: bool | None = None,
+    status: str | None = None,
+) -> None:
+    _emit("turn.status", sid, _turn_status_payload(session, running=running, status=status))
+
+
+def _clear_turn_state(session: dict) -> None:
+    for key in (
+        "turn_id",
+        "turn_started_at",
+        "turn_last_event_at",
+        "turn_last_event",
+        "turn_prompt_preview",
+        "turn_interrupt_requested",
+    ):
+        session.pop(key, None)
+
+
 def _count_list(obj: object, *path: str) -> int | None:
     cur = obj
     for key in path:
@@ -1560,6 +1649,7 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
+        _mark_turn_event(session, f"tool:{name}:started")
         try:
             from agent.display import capture_local_edit_snapshot
 
@@ -1585,6 +1675,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     snapshot = None
     started_at = None
     if session is not None:
+        _mark_turn_event(session, f"tool:{name}:complete")
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
     duration_s = time.time() - started_at if started_at else None
@@ -1626,6 +1717,7 @@ def _on_tool_progress(
     _args: dict | None = None,
     **_kwargs,
 ):
+    _mark_turn_event(_sessions.get(sid), event_type)
     if not _tool_progress_enabled(sid):
         return
     if event_type == "tool.started" and name:
@@ -1916,6 +2008,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["show_reasoning"] = _load_show_reasoning()
     session["tool_progress_mode"] = _load_tool_progress_mode()
     session["tool_started_at"] = {}
+    _clear_turn_state(session)
     with session["history_lock"]:
         session["history"] = []
         session["history_version"] = int(session.get("history_version", 0)) + 1
@@ -2525,6 +2618,20 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
+    turn = _turn_status_payload(session)
+    if turn.get("running"):
+        elapsed = _fmt_tool_duration(float(turn.get("elapsed_seconds") or 0.0))
+        last_age = _fmt_tool_duration(float(turn.get("last_event_age_seconds") or 0.0))
+        lines.append(f"Current Turn: running for {elapsed or '0.0s'}")
+        lines.append(
+            f"Turn Last Event: {turn.get('last_event') or 'unknown'}"
+            + (f" ({last_age} ago)" if last_age else "")
+        )
+        if turn.get("interrupt_requested"):
+            lines.append("Interrupt Requested: Yes")
+        prompt_preview = str(turn.get("prompt_preview") or "").strip()
+        if prompt_preview:
+            lines.append(f"Turn Prompt: {prompt_preview}")
     lines.extend(_vesta_status_lines(agent, key))
     return _ok(rid, {"output": "\n".join(lines)})
 
@@ -2787,6 +2894,9 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    session["turn_interrupt_requested"] = True
+    _mark_turn_event(session, "interrupt_requested")
+    _emit_turn_status(params.get("session_id", ""), session)
     if hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
     # Scope the pending-prompt release to THIS session.  A global
@@ -3076,6 +3186,8 @@ def _(rid, params: dict) -> dict:
         if session.get("running"):
             return _err(rid, 4009, "session busy")
         session["running"] = True
+        _start_turn_state(session, text)
+    _emit_turn_status(sid, session)
 
     _start_agent_build(sid, session)
 
@@ -3093,7 +3205,12 @@ def _(rid, params: dict) -> dict:
             )
             with session["history_lock"]:
                 session["running"] = False
+                _mark_turn_event(session, "agent_init_failed")
+                _emit_turn_status(sid, session, running=False, status="error")
+                _clear_turn_state(session)
             return
+        _mark_turn_event(session, "agent_ready")
+        _emit_turn_status(sid, session)
         _run_prompt_submit(rid, sid, session, text)
 
     threading.Thread(target=run_after_agent_ready, daemon=True).start()
@@ -3201,17 +3318,22 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
+        if session.get("running") and not session.get("turn_started_at"):
+            _start_turn_state(session, text)
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
     agent = session["agent"]
+    _mark_turn_event(session, "model_call_pending")
+    _emit_turn_status(sid, session)
     _emit("message.start", sid)
 
     def run():
         approval_token = None
         session_tokens = []
         goal_followup = None  # set by the post-turn goal hook below
+        turn_final_status = "complete"
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -3311,11 +3433,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_message = _enrich_with_attached_images(prompt, images)
 
             def _stream(delta):
+                _mark_turn_event(session, "streaming")
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
 
+            _mark_turn_event(session, "model_call")
+            _emit_turn_status(sid, session)
             result = agent.run_conversation(
                 run_message,
                 conversation_history=list(history),
@@ -3367,6 +3492,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                turn_final_status = status
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty
@@ -3385,6 +3511,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             else:
                 raw = str(result)
                 status = "complete"
+                turn_final_status = status
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
@@ -3507,6 +3634,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         except Exception as e:
             import traceback
 
+            turn_final_status = "error"
             trace = traceback.format_exc()
             try:
                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
@@ -3531,6 +3659,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _clear_session_context(session_tokens)
             with session["history_lock"]:
                 session["running"] = False
+                _mark_turn_event(session, turn_final_status)
+                _emit_turn_status(sid, session, running=False, status=turn_final_status)
+                _clear_turn_state(session)
 
         # Chain a goal-continuation turn if the judge said so. We do
         # this AFTER the finally releases session["running"], so the

@@ -87,7 +87,7 @@ model labels:
 ```yaml
 model:
   default: Qwen3.6-27B-MTP-Q6_K
-  provider: custom:vesta-local-llama
+  provider: custom
   base_url: http://192.168.1.117:1234/v1
   api_key: no-key-required
   api_mode: chat_completions
@@ -95,7 +95,7 @@ model:
 
 delegation:
   model: Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL
-  provider: custom:vesta-local-llama
+  provider: custom
   base_url: http://192.168.1.117:1234/v1
   api_key: no-key-required
   api_mode: chat_completions

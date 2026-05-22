@@ -2124,6 +2124,36 @@ def test_resolve_chat_argv_prefers_dashboard_terminal_cwd(monkeypatch, tmp_path)
     assert argv == ["node", "dist/entry.js"]
     assert cwd == str(workspace)
     assert env["TERMINAL_CWD"] == str(workspace)
+    assert env["HERMES_DASHBOARD_PTY"] == "1"
+
+
+def test_resolve_chat_argv_uses_configured_terminal_cwd(monkeypatch, tmp_path):
+    import hermes_cli.main as main
+    import hermes_cli.web_server as ws
+
+    workspace = tmp_path / "configured-workspace"
+    workspace.mkdir()
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_make_tui_argv",
+        lambda _path, tui_dev=False: (["node", "dist/entry.js"], tui_dir),
+    )
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.delenv("HERMES_DASHBOARD_TERMINAL_CWD", raising=False)
+    monkeypatch.setattr(
+        ws,
+        "load_config",
+        lambda: {"terminal": {"cwd": str(workspace)}},
+    )
+
+    argv, cwd, env = ws._resolve_chat_argv()
+
+    assert argv == ["node", "dist/entry.js"]
+    assert cwd == str(workspace)
+    assert env["TERMINAL_CWD"] == str(workspace)
+    assert env["HERMES_DASHBOARD_PTY"] == "1"
 
 
 @skip_on_windows

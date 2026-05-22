@@ -22,10 +22,14 @@ def _resolve_cwd(terminal_config: dict, defaults: dict, env: dict):
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
 
-    # Bridge: TERMINAL_CWD always exported in CLI, skipped in gateway
-    _is_gateway = env.get("_HERMES_GATEWAY") == "1"
+    # Bridge: TERMINAL_CWD always exported in CLI, skipped in gateway and
+    # dashboard PTY children where the launcher already set it.
+    preserve_existing_terminal_cwd = (
+        env.get("_HERMES_GATEWAY") == "1"
+        or (env.get("HERMES_DASHBOARD_PTY") == "1" and bool(env.get("TERMINAL_CWD")))
+    )
     if "cwd" in terminal_config:
-        if _is_gateway:
+        if preserve_existing_terminal_cwd:
             pass  # don't touch env
         else:
             env["TERMINAL_CWD"] = str(terminal_config["cwd"])
@@ -92,6 +96,13 @@ class TestGatewayLazyImport:
         d = {"terminal": {"cwd": "/home/user"}}
         result = _resolve_cwd(tc, d, env)
         assert result == "/home/user/project"
+
+    def test_dashboard_pty_cwd_preserved(self):
+        env = {"HERMES_DASHBOARD_PTY": "1", "TERMINAL_CWD": "/tmp/copy-workspace"}
+        tc = {"cwd": "/source/checkout", "env_type": "local"}
+        d = {"terminal": {"cwd": "/source/checkout"}}
+        result = _resolve_cwd(tc, d, env)
+        assert result == "/tmp/copy-workspace"
 
     def test_cli_overwrites_stale_env(self):
         env = {"TERMINAL_CWD": "/stale/from/dotenv"}
