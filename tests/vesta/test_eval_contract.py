@@ -12,6 +12,7 @@ from vesta_runtime import (
     write_finalization,
     write_research_artifact_section,
 )
+from tools.code_execution_tool import execute_code
 
 
 def _tool_call(name: str, args: dict) -> dict:
@@ -248,9 +249,62 @@ def test_eval_contract_blocks_execute_code_simulated_vesta_state(tmp_path, monke
     assert result["compliant"] is False
     assert result["verdict"] == "blocked"
     assert result["terminal_simulations"] == ["execute_code"]
-    finalization = run.finalization_path.read_text(encoding="utf-8")
-    assert "simulate Vesta state" in finalization
-    assert "Finalization Status: `blocked`" in run.control_plane_path.read_text(encoding="utf-8")
+
+
+def test_eval_contract_blocks_execute_code_proxying_typed_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "eval")
+    set_current_run(None)
+    run = create_run(
+        session_id="session_eval_contract",
+        workspace_path=tmp_path,
+        run_id="run_eval_contract_proxy_block",
+    )
+    artifact = tmp_path / "live-eval-artifacts" / "report.md"
+    seed_eval_contract_from_prompt(
+        prompt=(
+            f"Vesta eval mode research_ledger. Expected parent artifact: {artifact}. "
+            "Success criteria: finalize the run."
+        ),
+        session_id="session_eval_contract",
+    )
+    messages = [
+        _tool_call(
+            "execute_code",
+            {
+                "code": (
+                    "from hermes_tools import read_file\n"
+                    "print(read_file('/tmp/source.md'))\n"
+                )
+            },
+        ),
+    ]
+
+    result = enforce_eval_contract(
+        messages=messages,
+        final_response="PASS - artifact verified and finalization verdict accepted.",
+        objective="Run eval.",
+        session_id="session_eval_contract",
+    )
+
+    assert result["checked"] is True
+    assert result["compliant"] is False
+    assert result["typed_tool_proxy_bypasses"]
+    assert "proxying typed runtime/file tools" in "\n".join(result["failures"])
+    assert "proxying typed runtime/file tools" in run.finalization_path.read_text(encoding="utf-8")
+
+
+def test_execute_code_blocks_typed_tool_proxy_in_eval_mode(monkeypatch):
+    monkeypatch.setenv("VESTA_EVAL_MODE", "1")
+
+    result = json.loads(
+        execute_code(
+            "from hermes_tools import read_file\nprint(read_file('/tmp/source.md'))\n",
+            enabled_tools=["read_file"],
+        )
+    )
+
+    assert result["status"] == "blocked"
+    assert "use `read_file` directly" in result["error"]
 
 
 def test_eval_contract_accepts_typed_tool_order_and_vesta_state(tmp_path, monkeypatch):
@@ -376,6 +430,7 @@ def test_evidence_workflow_contract_accepts_section_writer_without_artifact_reco
         ),
         session_id="session_eval_evidence_workflow",
     )
+    contract_text = (run.run_dir / "eval-contract.md").read_text(encoding="utf-8")
     write_research_artifact_section(
         path=str(artifact),
         section="sources",
@@ -415,6 +470,7 @@ def test_evidence_workflow_contract_accepts_section_writer_without_artifact_reco
 
     assert seed["contract_profile"] == "research_ledger"
     assert seed["required_delegate_worker_id"] == ""
+    assert "`research_artifact_section_write or write_file`" in contract_text
     assert result["checked"] is True
     assert result["compliant"] is True
     assert result["contract_profile"] == "research_ledger"

@@ -877,6 +877,18 @@ def test_get_platform_tools_second_pass_skips_fully_claimed_toolsets():
     assert "search" not in enabled
 
 
+def test_get_platform_tools_keeps_vesta_runtime_tools_in_default_cli():
+    """The default CLI composite must not lose unconfigurable Vesta state tools.
+
+    TUI/dashboard sessions use this resolver before building the system prompt.
+    If the vesta toolset is dropped here, the model can read/write files but
+    never sees the ledger/finalization runtime contract.
+    """
+    enabled = _get_platform_tools({}, "cli")
+
+    assert "vesta" in enabled
+
+
 def test_get_platform_tools_discord_both_off_by_default():
     """Both `discord` and `discord_admin` are opt-in via `hermes tools`,
     even on the Discord platform itself.  Users shouldn't auto-inherit 19

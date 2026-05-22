@@ -30,21 +30,23 @@ import { Card } from "@/components/ui/card";
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
+import { api, type VestaSessionStatusResponse } from "@/lib/api";
 
 import { cn } from "@/lib/utils";
-import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
+import { AlertCircle, ChevronDown, ClipboardList, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 interface SessionInfo {
   cwd?: string;
   model?: string;
   provider?: string;
+  session_id?: string;
   credential_warning?: string;
 }
 
 interface RpcEnvelope {
   method?: string;
-  params?: { type?: string; payload?: unknown };
+  params?: { payload?: unknown; session_id?: string; type?: string };
 }
 
 const TOOL_LIMIT = 20;
@@ -68,12 +70,42 @@ const STATE_TONE: Record<
   error: "destructive",
 };
 
+function finalizationTone(
+  status: string | undefined,
+): "secondary" | "warning" | "success" | "destructive" | "outline" {
+  if (status === "accepted") return "success";
+  if (status === "blocked" || status === "failed") return "destructive";
+  if (status === "not_written" || !status) return "outline";
+  return "warning";
+}
+
+function shortPath(path: string | undefined): string {
+  if (!path) return "—";
+  const parts = path.split("/").filter(Boolean);
+  return parts.slice(-3).join("/") || path;
+}
+
+function shortModelName(model: string | undefined): string {
+  if (!model) return "—";
+  return model.split("/").filter(Boolean).slice(-1)[0] ?? model;
+}
+
+function runtimeSessionId(
+  payload: SessionInfo | undefined,
+  fallback: string | undefined,
+): string | null {
+  const sessionId = payload?.session_id?.trim();
+  if (sessionId) return sessionId;
+  return fallback?.trim() || null;
+}
+
 interface ChatSidebarProps {
   channel: string;
+  sessionIdHint?: string | null;
   className?: string;
 }
 
-export function ChatSidebar({ channel, className }: ChatSidebarProps) {
+export function ChatSidebar({ channel, sessionIdHint = null, className }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -83,11 +115,41 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   const gw = useMemo(() => new GatewayClient(), [version]);
 
   const [state, setState] = useState<ConnectionState>("idle");
-  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [controlSessionId, setControlSessionId] = useState<string | null>(null);
+  const [observedSessionId, setObservedSessionId] = useState<string | null>(
+    sessionIdHint,
+  );
   const [info, setInfo] = useState<SessionInfo>({});
   const [tools, setTools] = useState<ToolEntry[]>([]);
+  const [vesta, setVesta] = useState<VestaSessionStatusResponse | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const refreshVesta = useCallback((sid: string | null = observedSessionId) => {
+    if (!sid) {
+      setVesta(null);
+      return;
+    }
+
+    api
+      .getSessionVestaStatus(sid)
+      .then(async (primary) => {
+        if (primary.active || !sessionIdHint || sessionIdHint === sid) {
+          setVesta(primary);
+          return;
+        }
+
+        const fallback = await api.getSessionVestaStatus(sessionIdHint);
+        setVesta(fallback.active ? fallback : primary);
+      })
+      .catch(() => {
+        setVesta({ active: false, error: "Vesta status unavailable", session_id: sid });
+      });
+  }, [observedSessionId, sessionIdHint]);
+
+  useEffect(() => {
+    setObservedSessionId(sessionIdHint);
+  }, [sessionIdHint]);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,7 +157,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
 
     const offSessionInfo = gw.on<SessionInfo>("session.info", (ev) => {
       if (ev.session_id) {
-        setSessionId(ev.session_id);
+        setControlSessionId(ev.session_id);
       }
 
       if (ev.payload) {
@@ -125,7 +187,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
         if (cancelled || !created?.session_id) {
           return;
         }
-        setSessionId(created.session_id);
+        setControlSessionId(created.session_id);
       })
       .catch((e: Error) => {
         if (!cancelled) {
@@ -141,6 +203,17 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       gw.close();
     };
   }, [gw]);
+
+  useEffect(() => {
+    if (!observedSessionId) {
+      setVesta(null);
+      return;
+    }
+
+    refreshVesta(observedSessionId);
+    const id = window.setInterval(() => refreshVesta(observedSessionId), 5000);
+    return () => window.clearInterval(id);
+  }, [refreshVesta, observedSessionId]);
 
   // Event subscriber WebSocket — receives the rebroadcast of every
   // dispatcher emit from the PTY child's gateway.  See /api/pub +
@@ -194,8 +267,19 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       }
 
       const { type, payload } = frame.params;
+      const eventSessionId = frame.params.session_id;
 
-      if (type === "tool.start") {
+      if (type === "session.info") {
+        const p = payload as SessionInfo | undefined;
+        if (p) {
+          setInfo((prev) => ({ ...prev, ...p }));
+        }
+        const runtimeSid = runtimeSessionId(p, eventSessionId);
+        if (runtimeSid) {
+          setObservedSessionId(runtimeSid);
+          refreshVesta(runtimeSid);
+        }
+      } else if (type === "tool.start") {
         const p = payload as
           | { tool_id?: string; name?: string; context?: string }
           | undefined;
@@ -263,6 +347,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
               : t,
           ),
         );
+        refreshVesta();
       }
     });
 
@@ -270,7 +355,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       unmounting = true;
       ws.close();
     };
-  }, [channel, version]);
+  }, [channel, refreshVesta, version]);
 
   const reconnect = useCallback(() => {
     setError(null);
@@ -283,22 +368,43 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   // via PTY, so the sidebar doesn't need to surface output of its own.
   const onModelSubmit = useCallback(
     (slashCommand: string) => {
-      if (!sessionId) {
+      if (!controlSessionId) {
         return;
       }
 
       void gw.request("slash.exec", {
-        session_id: sessionId,
+        session_id: controlSessionId,
         command: slashCommand,
       });
       setModelOpen(false);
     },
-    [gw, sessionId],
+    [gw, controlSessionId],
   );
 
-  const canPickModel = state === "open" && !!sessionId;
+  const canPickModel = state === "open" && !!controlSessionId;
   const modelLabel = (info.model ?? "—").split("/").slice(-1)[0] ?? "—";
   const banner = error ?? info.credential_warning ?? null;
+  const vestaRun = vesta?.status;
+  const runtime = vestaRun?.runtime;
+  const workers = vestaRun?.worker_state?.workers ?? [];
+  const workerLanes = Array.from(
+    new Set(
+      workers
+        .map((worker) =>
+          typeof worker.model_lane === "string" ? worker.model_lane.trim() : "",
+        )
+        .filter(Boolean),
+    ),
+  );
+  const mainModel = runtime?.model;
+  const delegateModel = runtime?.delegation_model || workerLanes[0];
+  const openArtifactCount = vestaRun?.artifacts?.open_artifacts?.length ?? 0;
+  const artifactCount = vestaRun?.artifacts?.artifacts?.length ?? 0;
+  const workerCount = workers.length;
+  const blockerCount =
+    (vestaRun?.worker_state?.blockers?.length ?? 0) +
+    (vestaRun?.validator_blockers?.length ?? 0);
+  const finalization = vestaRun?.finalization_status ?? "not_written";
 
   return (
     <aside
@@ -355,6 +461,73 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
         </Card>
       )}
 
+      <Card className="flex flex-col gap-2 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <ClipboardList className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <div className="truncate text-xs uppercase tracking-wider text-muted-foreground">
+              vesta run
+            </div>
+          </div>
+
+          <Badge tone={vesta?.active ? finalizationTone(finalization) : "outline"}>
+            {vesta?.active ? finalization : "none"}
+          </Badge>
+        </div>
+
+        {vesta?.active && vestaRun ? (
+          <div className="grid gap-1 text-xs text-muted-foreground">
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>run</span>
+              <span className="min-w-0 truncate font-mono text-foreground" title={vestaRun.run_id}>
+                {vestaRun.run_id ?? "—"}
+              </span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>validator</span>
+              <span className="truncate text-foreground">{vestaRun.validator_status ?? "absent"}</span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>main</span>
+              <span className="min-w-0 truncate font-mono text-foreground" title={mainModel}>
+                {shortModelName(mainModel)}
+              </span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>validator</span>
+              <span className="min-w-0 truncate font-mono text-foreground" title={delegateModel}>
+                {shortModelName(delegateModel)}
+              </span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>artifacts</span>
+              <span className={openArtifactCount > 0 ? "text-warning" : "text-foreground"}>
+                {openArtifactCount} open / {artifactCount} total
+              </span>
+            </div>
+            <div className="flex min-w-0 justify-between gap-3">
+              <span>workers</span>
+              <span className={blockerCount > 0 ? "text-warning" : "text-foreground"}>
+                {workerCount} total{blockerCount > 0 ? ` · ${blockerCount} blockers` : ""}
+              </span>
+            </div>
+            <div className="grid gap-0.5">
+              <span>next action</span>
+              <span className="line-clamp-3 text-foreground">
+                {vestaRun.next_action || "unresolved"}
+              </span>
+            </div>
+            <div className="truncate font-mono text-[10px]" title={vestaRun.run_dir}>
+              {shortPath(vestaRun.run_dir)}
+            </div>
+          </div>
+        ) : (
+          <div className="text-xs text-muted-foreground">
+            {vesta?.error ?? "no Vesta state for this session yet"}
+          </div>
+        )}
+      </Card>
+
       <Card className="flex min-h-0 flex-none flex-col px-2 py-2">
         <div className="px-1 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
           tools
@@ -371,10 +544,10 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
         </div>
       </Card>
 
-      {modelOpen && canPickModel && sessionId && (
+      {modelOpen && canPickModel && controlSessionId && (
         <ModelPickerDialog
           gw={gw}
-          sessionId={sessionId}
+          sessionId={controlSessionId}
           onClose={() => setModelOpen(false)}
           onSubmit={onModelSubmit}
         />

@@ -4,11 +4,21 @@ from pathlib import Path
 
 from tools.file_tools import READ_FILE_SCHEMA, read_file_tool, search_tool
 from vesta_runtime import create_run, set_current_run
-from vesta_runtime.retrieval import reset_locator_history
+from vesta_runtime.retrieval import build_retrieval_prompt_contract, reset_locator_history
 
 
 def _write_lines(path: Path, count: int) -> None:
     path.write_text("".join(f"line {i}\n" for i in range(1, count + 1)), encoding="utf-8")
+
+
+def test_retrieval_prompt_contract_includes_duplicate_and_proxy_guidance():
+    contract = build_retrieval_prompt_contract()
+
+    assert "Vesta retrieval discipline:" in contract
+    assert "unchanged/BLOCKED" in contract
+    assert "synthesize once evidence is adequate" in contract
+    assert "do not bypass" in contract
+    assert len(contract.splitlines()) <= 7
 
 
 def test_disciplined_mode_blocks_unjustified_broad_read(tmp_path):

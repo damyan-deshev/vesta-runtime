@@ -1150,6 +1150,15 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    try:
+        from vesta_runtime.eval_policy import typed_tool_proxy_violation
+
+        violation = typed_tool_proxy_violation("execute_code", {"code": code})
+    except Exception:
+        violation = ""
+    if violation:
+        return json.dumps({"error": violation, "status": "blocked"}, ensure_ascii=False)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]

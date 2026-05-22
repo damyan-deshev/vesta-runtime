@@ -85,6 +85,7 @@ const CATEGORY_ICONS: Record<
   tool_loop_guardrails: Shield,
   tool_output: FileOutput,
   updates: RefreshCw,
+  vesta: Shield,
 };
 
 function CategoryIcon({

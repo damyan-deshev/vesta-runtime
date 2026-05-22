@@ -44,7 +44,9 @@ def build_retrieval_prompt_contract() -> str:
         "- For unfamiliar source files, locate before reading with search_files or a manifest/count tool.\n"
         f"- Prefer narrow read_file windows, normally <= {narrow_limit} lines.\n"
         "- Do not broad-read by default; broad reads require complete_coverage=true or a short broad_read_reason.\n"
-        "- When Vesta state tools are available, use them before reading raw ledger/control/finalization files."
+        "- When read_file says unchanged/BLOCKED for a duplicate region, use prior content, another window, or record a gap.\n"
+        "- Do not chase exhaustive coverage unless requested; synthesize once evidence is adequate and record gaps.\n"
+        "- Use typed Vesta/file tools directly; do not bypass them through terminal or execute_code."
     )
 
 

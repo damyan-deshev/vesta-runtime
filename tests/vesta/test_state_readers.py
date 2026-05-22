@@ -5,11 +5,14 @@ from vesta_runtime import (
     append_ledger_entry,
     artifact_manifest_status,
     create_run,
+    find_latest_run_for_session,
     ledger_search,
     ledger_status,
     ledger_tail,
     record_artifact,
+    record_session_rotation,
     run_status,
+    run_status_from_dir,
     set_current_run,
     write_finalization,
 )
@@ -17,7 +20,13 @@ from vesta_runtime import (
 
 def test_vesta_state_readers_return_bounded_structured_state(tmp_path):
     set_current_run(None)
-    run = create_run(session_id="session_state", workspace_path=tmp_path, run_id="run_state")
+    run = create_run(
+        session_id="session_state",
+        workspace_path=tmp_path,
+        run_id="run_state",
+        model="Qwen3.6-27B-MTP-Q6_K",
+        provider="custom:vesta-local-llama",
+    )
     report = tmp_path / "report.md"
     report.write_text("report", encoding="utf-8")
     record_artifact(
@@ -55,7 +64,39 @@ def test_vesta_state_readers_return_bounded_structured_state(tmp_path):
     assert search["total_matching"] >= 1
     assert manifest["counts_by_status"]["exists"] == 1
     assert run_state["finalization_status"] == "accepted"
+    assert run_state["runtime"]["model"] == "Qwen3.6-27B-MTP-Q6_K"
+    assert run_state["runtime"]["provider"] == "custom:vesta-local-llama"
     assert run_state["artifacts"]["artifacts"][0]["status"] == "exists"
+
+
+def test_run_status_next_action_prefers_finalization_over_stale_ledger(tmp_path):
+    set_current_run(None)
+    run = create_run(
+        session_id="session_final_next",
+        workspace_path=tmp_path,
+        run_id="run_final_next",
+    )
+    append_ledger_entry(
+        entry_type="commitment",
+        title="Seed eval contract",
+        statement="Model must satisfy typed Vesta eval tool order before final response.",
+        status="active",
+        materiality="critical",
+        next_action="Model must satisfy typed Vesta eval tool order before final response.",
+        session_id="session_final_next",
+    )
+
+    write_finalization(
+        objective="Finish run.",
+        verification="No artifacts required.",
+        session_id="session_final_next",
+    )
+
+    status = run_status(session_id="session_final_next")
+
+    assert status["finalization_status"] == "accepted"
+    assert status["next_action"] == "none"
+    assert "Latest Next Action: none" in run.control_plane_path.read_text(encoding="utf-8")
 
 
 def test_vesta_state_reader_tools_update_active_run(tmp_path, monkeypatch):
@@ -77,3 +118,52 @@ def test_vesta_state_reader_tools_update_active_run(tmp_path, monkeypatch):
     assert result["success"] is True
     assert result["counts_by_type"]["gap"] == 1
     assert result["gaps"][0]["statement"] == "One gap remains."
+
+
+def test_vesta_status_can_be_read_from_existing_run_dir(tmp_path):
+    set_current_run(None)
+    run = create_run(session_id="session_status_dir", workspace_path=tmp_path, run_id="run_status_dir")
+    write_finalization(
+        objective="Read status from run dir.",
+        verification="No artifacts required.",
+        session_id="session_status_dir",
+    )
+    set_current_run(None)
+
+    status = run_status_from_dir(run.run_dir)
+
+    assert status is not None
+    assert status["run_id"] == "run_status_dir"
+    assert status["finalization_status"] == "accepted"
+    assert status["run_dir"] == str(run.run_dir)
+
+
+def test_latest_vesta_run_lookup_follows_session_lineage(tmp_path):
+    set_current_run(None)
+    old = create_run(session_id="session_old", workspace_path=tmp_path, run_id="run_old")
+    write_finalization(
+        objective="Old run.",
+        failures=["blocked"],
+        session_id="session_old",
+    )
+    set_current_run(None)
+    run = create_run(session_id="session_a", workspace_path=tmp_path, run_id="run_lookup")
+    record_session_rotation(
+        old_session_id="session_a",
+        new_session_id="session_b",
+        reason="compression",
+    )
+    write_finalization(
+        objective="Lookup latest run.",
+        verification="Done.",
+        session_id="session_b",
+    )
+    set_current_run(None)
+
+    status = find_latest_run_for_session("session_b")
+
+    assert status is not None
+    assert status["run_id"] == run.run_id
+    assert status["matched_session_id"] == "session_b"
+    assert status["finalization_status"] == "accepted"
+    assert status["lineage"]["hermes_session_id"] == "session_a"

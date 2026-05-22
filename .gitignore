@@ -85,3 +85,8 @@ work/vesta-runtime/vesta-next-live-suite-plan-*.md
 work/vesta-runtime/post-*-live-evidence-*.md
 work/vesta-runtime/post-*-s*-*.md
 work/vesta-runtime/scratch/
+work/vesta-runtime/qa-artifacts/
+work/vesta-runtime/vesta-ui-exposure-qa-report.md
+work/vesta-runtime/ui-live-*-prompt-*.md
+work/vesta-runtime/sensenova-*.md
+work/vesta-runtime/normalizer-spike-*/

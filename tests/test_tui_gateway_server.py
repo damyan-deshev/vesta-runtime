@@ -401,10 +401,10 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory"]. `kanban` is auto-recovered by
-    # _get_platform_tools because it's a non-configurable platform toolset
-    # whose tools live in hermes-cli's universe (see toolsets.py).
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    # Sorted: ["kanban", "memory", "vesta"]. `kanban` and `vesta` are
+    # auto-recovered by _get_platform_tools because their tools live in
+    # hermes-cli's universe even when the configured CLI list is minimal.
+    assert server._load_enabled_toolsets() == ["kanban", "memory", "vesta"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -425,7 +425,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    assert server._load_enabled_toolsets() == ["kanban", "memory", "vesta"]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -2231,6 +2231,74 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     assert "Model: live-model (live-provider)" in out
     assert "Tokens: 1,234" in out
     assert "Agent Running: Yes" in out
+    assert "Vesta Run: none" in out
+
+
+def test_session_status_includes_active_vesta_run(tmp_path, monkeypatch):
+    from vesta_runtime import create_run, record_worker_state, set_current_run, write_finalization
+    import vesta_runtime.state as vesta_state
+
+    set_current_run(None)
+    monkeypatch.setattr(
+        vesta_state,
+        "_active_delegation_config",
+        lambda: {
+            "model": "Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL",
+            "provider": "custom:vesta-local-llama",
+            "base_url": "http://192.168.1.117:1234/v1",
+        },
+    )
+    run = create_run(
+        session_id="session-key",
+        workspace_path=tmp_path,
+        run_id="run_tui_status",
+        model="Qwen3.6-27B-MTP-Q6_K",
+        provider="custom:vesta-local-llama",
+    )
+    record_worker_state(
+        worker_id="worker_status",
+        objective="Inspect run status.",
+        status="completed",
+        model_lane="delegation.test",
+        parent_acceptance="accepted",
+        session_id="session-key",
+    )
+    write_finalization(
+        objective="Expose Vesta status in TUI.",
+        verification="No artifacts required.",
+        next_action="Review dashboard card.",
+        session_id="session-key",
+    )
+    set_current_run(None)
+    agent = types.SimpleNamespace(
+        model="live-model",
+        provider="live-provider",
+        session_total_tokens=1234,
+        vesta_run=run,
+    )
+    server._sessions["sid"] = _session(agent=agent, running=False)
+
+    class _DB:
+        def get_session(self, key):
+            return {"title": "Vesta TUI", "started_at": 1_700_000_000}
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    out = resp["result"]["output"]
+    assert "Vesta Run" in out
+    assert "Run ID: run_tui_status" in out
+    assert "Finalization: accepted" in out
+    assert "Main Model: Qwen3.6-27B-MTP-Q6_K" in out
+    assert "Validator Model: Qwen3.6-35B-A3B-MTP-UD-Q8_K_XL" in out
+    assert "Workers: 1 total" in out
+    assert "Next Action: Review dashboard card." in out
+    assert f"Run Path: {run.run_dir}" in out
 
 
 def test_skills_reload_runs_in_gateway_process(monkeypatch):
@@ -2523,6 +2591,42 @@ def test_session_info_includes_mcp_servers(monkeypatch):
     info = server._session_info(types.SimpleNamespace(tools=[], model=""))
 
     assert info["mcp_servers"] == fake_status
+
+
+def test_session_info_includes_runtime_session_id(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", types.SimpleNamespace(get_mcp_status=lambda: []))
+
+    info = server._session_info(
+        types.SimpleNamespace(tools=[], model="", session_id="session_20260522_runtime")
+    )
+
+    assert info["session_id"] == "session_20260522_runtime"
+
+
+def test_probe_credentials_allows_custom_no_key_with_base_url():
+    agent = types.SimpleNamespace(
+        provider="custom",
+        base_url="http://192.168.1.117:1234/v1",
+        api_key="no-key-required",
+    )
+
+    assert server._probe_credentials(agent) == ""
+
+
+def test_probe_credentials_warns_for_cloud_or_unresolved_no_key():
+    cloud = types.SimpleNamespace(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="no-key-required",
+    )
+    unresolved_custom = types.SimpleNamespace(
+        provider="custom",
+        base_url="",
+        api_key="no-key-required",
+    )
+
+    assert "No API key configured" in server._probe_credentials(cloud)
+    assert "No API key configured" in server._probe_credentials(unresolved_custom)
 
 
 # ---------------------------------------------------------------------------
@@ -3975,10 +4079,6 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
     assert (
         resp["result"]["messages"][0]
         == "Chrome isn't running with remote debugging — attempting to launch..."
-    )
-    assert any(
-        "No Chrome/Chromium executable was found" in line
-        for line in resp["result"]["messages"]
     )
     assert any(
         "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]

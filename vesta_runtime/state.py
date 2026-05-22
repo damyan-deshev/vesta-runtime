@@ -231,6 +231,89 @@ def _run_from_env() -> VestaRun | None:
     return None
 
 
+def _run_from_dir(run_dir: str | os.PathLike[str]) -> VestaRun | None:
+    """Build a VestaRun handle for an existing run directory."""
+
+    path = Path(run_dir)
+    if not path.is_dir():
+        return None
+    run_md = path / "run.md"
+    run_id = _parse_md_field(run_md, "Run ID") or path.name
+    try:
+        context_length = int(_parse_md_field(run_md, "Context Length Tokens") or "0") or None
+    except (TypeError, ValueError):
+        context_length = None
+    return VestaRun(
+        run_id=run_id,
+        workspace_hash=_parse_md_field(run_md, "Workspace Hash"),
+        workspace_path=_parse_md_field(run_md, "Workspace Path"),
+        run_dir=path,
+        run_md_path=run_md,
+        ledger_path=path / "ledger.md",
+        resume_packet_path=path / "resume-packet.md",
+        artifact_manifest_path=path / "artifact-manifest.md",
+        finalization_path=path / "finalization.md",
+        worker_state_path=path / "worker-state.md",
+        validator_result_path=path / "validator-result.md",
+        control_plane_path=path / "control-plane.md",
+        handoff_path=path / "handoff.md",
+        raw_dir=path / "raw",
+        raw_index_path=path / "raw" / "index.md",
+        created_at=_parse_md_field(run_md, "Created At"),
+        context_length=context_length,
+    )
+
+
+def _run_mentions_session(run_dir: Path, session_id: str) -> bool:
+    if not session_id:
+        return False
+    run_md = run_dir / "run.md"
+    if _parse_md_field(run_md, "Hermes Session ID") == session_id:
+        return True
+    if _parse_md_field(run_md, "Hermes Parent Session ID") == session_id:
+        return True
+    try:
+        text = run_md.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    needles = (
+        f"- {session_id}",
+        f"Old Session ID: `{session_id}`",
+        f"New Session ID: `{session_id}`",
+        f"Resumed From Session ID: `{session_id}`",
+    )
+    return any(needle in text for needle in needles)
+
+
+def find_latest_run_for_session(session_id: str) -> dict[str, Any] | None:
+    """Find the newest Vesta run that references a Hermes session id."""
+
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    runs_root = get_hermes_home() / "vesta" / "workspaces"
+    candidates: list[Path] = []
+    try:
+        workspaces = [path for path in runs_root.iterdir() if path.is_dir()]
+    except OSError:
+        return None
+    for workspace in workspaces:
+        try:
+            run_dirs = [path for path in (workspace / "runs").iterdir() if path.is_dir()]
+        except OSError:
+            continue
+        candidates.extend(run_dir for run_dir in run_dirs if _run_mentions_session(run_dir, sid))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name))
+    run = _run_from_dir(candidates[-1])
+    if run is None:
+        return None
+    status = _run_status_for_run(run)
+    status["matched_session_id"] = sid
+    return status
+
+
 def create_run(
     *,
     session_id: str,
@@ -331,6 +414,38 @@ def ensure_current_run(*, session_id: str | None = None) -> VestaRun:
     return create_run(session_id=sid)
 
 
+def _active_model_config() -> dict[str, str]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("model", {})
+        if isinstance(cfg, dict):
+            return {
+                "model": str(cfg.get("default") or cfg.get("model") or "").strip(),
+                "provider": str(cfg.get("provider") or "").strip(),
+                "base_url": str(cfg.get("base_url") or "").strip(),
+            }
+    except Exception:
+        pass
+    return {"model": "", "provider": "", "base_url": ""}
+
+
+def _active_delegation_config() -> dict[str, str]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config().get("delegation", {})
+        if isinstance(cfg, dict):
+            return {
+                "model": str(cfg.get("model") or "").strip(),
+                "provider": str(cfg.get("provider") or "").strip(),
+                "base_url": str(cfg.get("base_url") or "").strip(),
+            }
+    except Exception:
+        pass
+    return {"model": "", "provider": "", "base_url": ""}
+
+
 def _render_run_seed(
     *,
     run: VestaRun,
@@ -348,6 +463,10 @@ def _render_run_seed(
     if parent:
         session_lineage = f"- {parent}\n- {session_id}"
     run_link = lineage or {}
+    model_cfg = _active_model_config()
+    delegation_cfg = _active_delegation_config()
+    resolved_model = model or model_cfg.get("model", "")
+    resolved_provider = provider or model_cfg.get("provider", "")
     return f"""# Vesta Run
 
 Run ID: `{run.run_id}`
@@ -357,10 +476,14 @@ Workspace Path: `{run.workspace_path}`
 Hermes Session ID: `{session_id}`
 Hermes Parent Session ID: `{parent}`
 Task ID: `{task_id or ''}`
-Model: `{model or ''}`
-Provider: `{provider or ''}`
+Model: `{resolved_model or ''}`
+Provider: `{resolved_provider or ''}`
+Base URL: `{model_cfg.get('base_url', '')}`
 Platform: `{platform or ''}`
 Context Length Tokens: `{context_length or ''}`
+Delegation Model: `{delegation_cfg.get('model', '')}`
+Delegation Provider: `{delegation_cfg.get('provider', '')}`
+Delegation Base URL: `{delegation_cfg.get('base_url', '')}`
 
 ## Hermes Session Lineage
 
@@ -1693,7 +1816,7 @@ def write_control_plane_snapshot(
     validator_state = _validator_finalization_state(run)
     worker_state = _worker_finalization_state(run)
     artifacts = _latest_artifact_blocks(run)
-    resolved_next_action = (next_action or "").strip() or _latest_ledger_next_action(run) or "Consult ledger."
+    resolved_next_action = (next_action or "").strip() or _run_next_action(run) or "Consult ledger."
 
     content = f"""# Vesta Control Plane Snapshot
 
@@ -1785,7 +1908,7 @@ def write_handoff(
     finalization_status = _finalization_status(run)
     validator_state = _validator_finalization_state(run)
     worker_state = _worker_finalization_state(run)
-    resolved_next_action = (next_action or "").strip() or _latest_ledger_next_action(run) or "Continue from handoff."
+    resolved_next_action = (next_action or "").strip() or _run_next_action(run) or "Continue from handoff."
     resolved_objective = (objective or "").strip() or "See run objective and ledger entries."
 
     content = f"""# Vesta Handoff
@@ -1901,6 +2024,31 @@ def _finalization_status(run: VestaRun) -> str:
         if line.startswith("Verdict: `") and line.endswith("`"):
             return line[len("Verdict: `"):-1]
     return "not_written"
+
+
+def _finalization_next_action(run: VestaRun) -> str:
+    try:
+        lines = run.finalization_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    in_section = False
+    collected: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "## Next Action":
+            in_section = True
+            continue
+        if in_section and stripped.startswith("## "):
+            break
+        if in_section and stripped:
+            collected.append(stripped[2:].strip() if stripped.startswith("- ") else stripped)
+    return " ".join(collected).strip()
+
+
+def _run_next_action(run: VestaRun) -> str:
+    if _finalization_status(run) != "not_written":
+        return _finalization_next_action(run) or "none"
+    return _latest_ledger_next_action(run)
 
 
 def _latest_ledger_next_action(run: VestaRun) -> str:
@@ -2128,11 +2276,32 @@ def artifact_manifest_status(*, session_id: str | None = None) -> dict[str, Any]
     }
 
 
-def run_status(*, session_id: str | None = None) -> dict[str, Any]:
-    run = ensure_current_run(session_id=session_id)
+def _run_runtime_metadata(run: VestaRun) -> dict[str, str]:
+    return {
+        "model": _parse_md_field(run.run_md_path, "Model"),
+        "provider": _parse_md_field(run.run_md_path, "Provider"),
+        "base_url": _parse_md_field(run.run_md_path, "Base URL"),
+        "context_length_tokens": _parse_md_field(run.run_md_path, "Context Length Tokens"),
+        "delegation_model": _parse_md_field(run.run_md_path, "Delegation Model"),
+        "delegation_provider": _parse_md_field(run.run_md_path, "Delegation Provider"),
+        "delegation_base_url": _parse_md_field(run.run_md_path, "Delegation Base URL"),
+    }
+
+
+def _run_status_for_run(run: VestaRun) -> dict[str, Any]:
     validator_state = _validator_finalization_state(run)
     worker_state = _worker_finalization_state(run)
-    artifacts = artifact_manifest_status(session_id=session_id)
+    latest_artifacts = _latest_artifact_blocks(run)
+    artifacts = {
+        "run_id": run.run_id,
+        "artifact_manifest_path": str(run.artifact_manifest_path),
+        "artifacts": latest_artifacts,
+        "counts_by_status": _entry_counts(latest_artifacts, "status"),
+        "open_artifacts": [
+            artifact for artifact in latest_artifacts
+            if artifact.get("status") in {"expected", "missing"}
+        ],
+    }
     return {
         "run_id": run.run_id,
         "run_dir": str(run.run_dir),
@@ -2143,13 +2312,28 @@ def run_status(*, session_id: str | None = None) -> dict[str, Any]:
         "control_plane_path": str(run.control_plane_path),
         "handoff_path": str(run.handoff_path),
         "finalization_status": _finalization_status(run),
-        "next_action": _latest_ledger_next_action(run),
+        "next_action": _run_next_action(run),
+        "runtime": _run_runtime_metadata(run),
         "lineage": _run_lineage_metadata(run),
         "artifacts": artifacts,
         "worker_state": worker_state,
         "validator_status": validator_state.get("status", "absent"),
         "validator_blockers": validator_state.get("blockers", []),
     }
+
+
+def run_status(*, session_id: str | None = None) -> dict[str, Any]:
+    run = ensure_current_run(session_id=session_id)
+    return _run_status_for_run(run)
+
+
+def run_status_from_dir(run_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """Return bounded Vesta status for an existing run directory."""
+
+    run = _run_from_dir(run_dir)
+    if run is None:
+        return None
+    return _run_status_for_run(run)
 
 
 def write_finalization(

@@ -6,9 +6,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import os
+import re
 
 
 _TRUTHY = {"1", "true", "yes", "on", "enabled"}
+TYPED_TOOL_PROXY_BYPASS_TOOLS = (
+    "read_file",
+    "search_files",
+    "write_file",
+    "patch",
+    "ledger_append",
+    "artifact_record",
+    "finalize_run",
+    "run_status",
+    "ledger_status",
+    "artifact_manifest_status",
+)
 
 
 @dataclass(frozen=True)
@@ -134,4 +147,43 @@ def forbidden_arg_violations(events: list[dict[str, Any]]) -> list[str]:
                 label = f"{tool}.{arg_name}" if tool else arg_name
                 if label not in violations:
                     violations.append(label)
+    return violations
+
+
+def typed_tool_proxy_violation(tool_name: str, args: dict[str, Any]) -> str:
+    """Return an eval violation when code/terminal proxies typed Vesta tools."""
+
+    policy = load_eval_policy()
+    if not policy.enabled:
+        return ""
+    text = ""
+    if tool_name == "execute_code":
+        text = str(args.get("code") or "")
+    elif tool_name == "terminal":
+        text = str(args.get("command") or "")
+    else:
+        return ""
+    if "hermes_tools" not in text:
+        return ""
+    for proxied_tool in TYPED_TOOL_PROXY_BYPASS_TOOLS:
+        pattern = rf"\b{re.escape(proxied_tool)}\s*\("
+        import_pattern = rf"from\s+hermes_tools\s+import\b[^\n#]*\b{re.escape(proxied_tool)}\b"
+        if re.search(pattern, text) or re.search(import_pattern, text):
+            return (
+                "Vesta eval policy blocks proxying typed runtime/file tools "
+                f"through {tool_name}: use `{proxied_tool}` directly or record "
+                "a gap instead."
+            )
+    return ""
+
+
+def typed_tool_proxy_violations(events: list[dict[str, Any]]) -> list[str]:
+    violations: list[str] = []
+    for event in events:
+        args = event.get("args") or {}
+        if not isinstance(args, dict):
+            continue
+        violation = typed_tool_proxy_violation(str(event.get("name") or ""), args)
+        if violation and violation not in violations:
+            violations.append(violation)
     return violations

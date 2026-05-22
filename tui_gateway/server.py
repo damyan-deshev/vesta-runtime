@@ -845,6 +845,69 @@ def _coerce_statusbar(raw) -> str:
     return "top"
 
 
+def _vesta_status_lines(agent, session_key: str) -> list[str]:
+    """Return a compact Vesta block for /status without creating a run."""
+
+    try:
+        from vesta_runtime import find_latest_run_for_session, run_status_from_dir
+
+        status = None
+        run = getattr(agent, "vesta_run", None) if agent is not None else None
+        run_dir = getattr(run, "run_dir", None)
+        if run_dir:
+            status = run_status_from_dir(run_dir)
+        if status is None and session_key:
+            status = find_latest_run_for_session(session_key)
+    except Exception as exc:
+        return ["", "Vesta Run: unavailable", f"Vesta Error: {exc}"]
+
+    if not status:
+        return ["", "Vesta Run: none"]
+
+    artifacts = status.get("artifacts") if isinstance(status.get("artifacts"), dict) else {}
+    artifact_items = artifacts.get("artifacts") if isinstance(artifacts, dict) else []
+    open_artifacts = artifacts.get("open_artifacts") if isinstance(artifacts, dict) else []
+    worker_state = status.get("worker_state") if isinstance(status.get("worker_state"), dict) else {}
+    workers = worker_state.get("workers") if isinstance(worker_state, dict) else []
+    worker_blockers = worker_state.get("blockers") if isinstance(worker_state, dict) else []
+    validator_blockers = status.get("validator_blockers") or []
+    runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
+    main_model = str(runtime.get("model") or "").strip()
+    delegation_model = str(runtime.get("delegation_model") or "").strip()
+    worker_lanes = sorted({
+        str(worker.get("model_lane") or "").strip()
+        for worker in workers
+        if isinstance(worker, dict) and str(worker.get("model_lane") or "").strip()
+    })
+    next_action = str(status.get("next_action") or "").strip() or "unresolved"
+
+    lines = [
+        "",
+        "Vesta Run",
+        f"Run ID: {status.get('run_id') or '(unknown)'}",
+        f"Finalization: {status.get('finalization_status') or 'not_written'}",
+        f"Validator: {status.get('validator_status') or 'absent'}",
+        f"Main Model: {main_model or '(unknown)'}",
+        f"Validator Model: {delegation_model or (worker_lanes[0] if worker_lanes else '(none)')}",
+        f"Artifacts: {len(open_artifacts)} open / {len(artifact_items)} total",
+        f"Workers: {len(workers)} total",
+    ]
+    if len(worker_lanes) > 1:
+        lines.append(f"Worker Lanes: {', '.join(worker_lanes)}")
+    if worker_blockers:
+        lines.append(f"Worker Blockers: {', '.join(str(b) for b in worker_blockers)}")
+    if validator_blockers:
+        lines.append(f"Validator Blockers: {', '.join(str(b) for b in validator_blockers)}")
+    lines.extend(
+        [
+            f"Next Action: {next_action}",
+            f"Run Path: {status.get('run_dir') or ''}",
+            f"Ledger: {status.get('ledger_path') or ''}",
+        ]
+    )
+    return lines
+
+
 def _display_mouse_tracking(display: dict) -> bool:
     """Return canonical display.mouse_tracking with legacy tui_mouse fallback."""
     if not isinstance(display, dict):
@@ -1326,6 +1389,9 @@ def _probe_credentials(agent) -> str:
     try:
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
+        base_url = getattr(agent, "base_url", "") or ""
+        if key == "no-key-required" and provider == "custom" and base_url:
+            return ""
         if not key or key == "no-key-required":
             return f"No API key configured for provider '{provider}'. First message will fail."
     except Exception:
@@ -1376,6 +1442,7 @@ def _session_info(agent) -> dict:
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
     info: dict = {
+        "session_id": getattr(agent, "session_id", "") or "",
         "model": getattr(agent, "model", ""),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -2458,6 +2525,7 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
+    lines.extend(_vesta_status_lines(agent, key))
     return _ok(rid, {"output": "\n".join(lines)})
 
 

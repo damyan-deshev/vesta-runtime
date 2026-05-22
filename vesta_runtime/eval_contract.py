@@ -24,7 +24,7 @@ from .state import (
     _latest_artifact_blocks,
     _finalization_status,
 )
-from .eval_policy import forbidden_arg_violations
+from .eval_policy import forbidden_arg_violations, typed_tool_proxy_violations
 
 
 REQUIRED_EVAL_TOOL_ORDER = (
@@ -48,6 +48,16 @@ PROFILE_REQUIRED_TOOL_ORDER = {
         "artifact_record:expected",
         "ledger_append",
         "write_file",
+        "artifact_record:exists",
+        "finalize_run",
+    ),
+}
+PROFILE_PROMPT_TOOL_ORDER = {
+    **PROFILE_REQUIRED_TOOL_ORDER,
+    "research_ledger": (
+        "artifact_record:expected",
+        "ledger_append",
+        "research_artifact_section_write or write_file",
         "artifact_record:exists",
         "finalize_run",
     ),
@@ -326,6 +336,7 @@ def seed_eval_contract_from_prompt(
         }
 
     required_order = PROFILE_REQUIRED_TOOL_ORDER[contract_profile]
+    prompt_order = PROFILE_PROMPT_TOOL_ORDER[contract_profile]
     content = (
         "# Vesta Eval Contract\n\n"
         f"Run ID: `{run.run_id}`\n"
@@ -334,7 +345,7 @@ def seed_eval_contract_from_prompt(
         f"{required_delegate_worker_line}"
         f"{required_delegate_artifact_line}"
         "- Required Tool Order:\n"
-        + "".join(f"  - `{item}`\n" for item in required_order)
+        + "".join(f"  - `{item}`\n" for item in prompt_order)
         + "- State Simulation: `non_compliant`\n"
     )
     contract_path.write_text(content, encoding="utf-8")
@@ -361,7 +372,7 @@ def seed_eval_contract_from_prompt(
             "contract_profile": contract_profile,
             "required_delegate_worker_id": required_delegate_worker_id,
             "required_delegate_artifact": required_delegate_artifact,
-            "required_tool_order": list(required_order),
+            "required_tool_order": list(prompt_order),
         },
     )
     return {
@@ -689,6 +700,7 @@ def enforce_eval_contract(
     )
     simulations = _terminal_simulations(events)
     forbidden_args = forbidden_arg_violations(events)
+    proxy_bypasses = typed_tool_proxy_violations(events)
     delegate_contract_failures = _delegate_output_contract_failures(events)
     finalization_status = _finalization_status(run)
 
@@ -709,6 +721,7 @@ def enforce_eval_contract(
             "Eval scenario used forbidden tool arguments: "
             + ", ".join(forbidden_args)
         )
+    failures.extend(proxy_bypasses)
     failures.extend(delegate_contract_failures)
     if _final_response_claims_success(final_response) and finalization_status not in {
         "accepted",
@@ -758,6 +771,7 @@ def enforce_eval_contract(
         "missing_order": missing,
         "terminal_simulations": simulations,
         "forbidden_tool_args": forbidden_args,
+        "typed_tool_proxy_bypasses": proxy_bypasses,
         "delegate_contract_failures": delegate_contract_failures,
         "contract_profile": contract_profile,
         "finalization_path": result["finalization_path"],

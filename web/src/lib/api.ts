@@ -71,6 +71,14 @@ export const api = {
     fetchJSON<SessionLatestDescendantResponse>(
       `/api/sessions/${encodeURIComponent(id)}/latest-descendant`,
     ),
+  getSessionVestaStatus: (id: string) =>
+    fetchJSON<VestaSessionStatusResponse>(
+      `/api/sessions/${encodeURIComponent(id)}/vesta`,
+    ),
+  getVestaRunStatus: (id: string) =>
+    fetchJSON<VestaRunStatus>(`/api/vesta/runs/${encodeURIComponent(id)}/status`),
+  getVestaRuns: (limit = 20) =>
+    fetchJSON<VestaRunsResponse>(`/api/vesta/runs?limit=${limit}`),
   deleteSession: (id: string) =>
     fetchJSON<{ ok: boolean }>(`/api/sessions/${encodeURIComponent(id)}`, {
       method: "DELETE",
@@ -403,6 +411,61 @@ export interface SessionLatestDescendantResponse {
   session_id: string;
   path: string[];
   changed: boolean;
+}
+
+export interface VestaArtifact {
+  id?: string;
+  path?: string;
+  status?: string;
+  artifact_type?: string;
+}
+
+export interface VestaWorkerState {
+  blockers?: string[];
+  workers?: Array<Record<string, unknown>>;
+}
+
+export interface VestaRunStatus {
+  artifact_manifest_path?: string;
+  artifacts?: {
+    artifacts?: VestaArtifact[];
+    counts_by_status?: Record<string, number>;
+    open_artifacts?: VestaArtifact[];
+  };
+  control_plane_path?: string;
+  finalization_path?: string;
+  finalization_status?: string;
+  handoff_path?: string;
+  ledger_path?: string;
+  lineage?: Record<string, string>;
+  next_action?: string;
+  runtime?: {
+    base_url?: string;
+    context_length_tokens?: string;
+    delegation_base_url?: string;
+    delegation_model?: string;
+    delegation_provider?: string;
+    model?: string;
+    provider?: string;
+  };
+  run_dir?: string;
+  run_id?: string;
+  validator_blockers?: string[];
+  validator_status?: string;
+  worker_state?: VestaWorkerState;
+  workspace_path?: string;
+}
+
+export interface VestaSessionStatusResponse {
+  active: boolean;
+  error?: string;
+  session_id: string;
+  status?: VestaRunStatus;
+}
+
+export interface VestaRunsResponse {
+  limit: number;
+  runs: VestaRunStatus[];
 }
 
 export interface PaginatedSessions {

@@ -344,6 +344,21 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "low", "medium", "high"],
     },
+    "vesta.retrieval.mode": {
+        "type": "select",
+        "description": "Vesta retrieval strictness for new runs",
+        "options": ["disciplined", "permissive"],
+    },
+    "vesta.eval.contract_profile": {
+        "type": "select",
+        "description": "Vesta eval contract profile",
+        "options": [
+            "artifact_positive",
+            "research_ledger",
+            "coding_fix",
+            "negative_tool_simulation",
+        ],
+    },
 }
 
 # Categories with fewer fields get merged into "general" to avoid tab sprawl.
@@ -370,7 +385,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
 _CATEGORY_ORDER = [
     "general", "agent", "terminal", "display", "delegation",
     "memory", "compression", "security", "browser", "voice",
-    "tts", "stt", "logging", "discord", "auxiliary",
+    "tts", "stt", "logging", "discord", "auxiliary", "vesta",
 ]
 
 
@@ -2444,6 +2459,89 @@ async def get_session_messages(session_id: str):
         db.close()
 
 
+def _iter_vesta_run_dirs() -> List[Path]:
+    runs_root = get_hermes_home() / "vesta" / "workspaces"
+    try:
+        workspaces = [path for path in runs_root.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+    runs: List[Path] = []
+    for workspace in workspaces:
+        workspace_runs = workspace / "runs"
+        try:
+            runs.extend(path for path in workspace_runs.iterdir() if path.is_dir())
+        except OSError:
+            continue
+    runs.sort(key=lambda path: (path.stat().st_mtime if path.exists() else 0, path.name), reverse=True)
+    return runs
+
+
+def _vesta_status_for_session_id(session_id: str) -> Dict[str, Any]:
+    try:
+        from vesta_runtime import find_latest_run_for_session
+
+        status = find_latest_run_for_session(session_id)
+    except Exception as exc:
+        return {"active": False, "error": str(exc), "session_id": session_id}
+    if not status:
+        return {"active": False, "session_id": session_id}
+    return {"active": True, "session_id": session_id, "status": status}
+
+
+@app.get("/api/sessions/{session_id}/vesta")
+async def get_session_vesta_status(session_id: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        resolved = db.resolve_session_id(session_id) or session_id
+    finally:
+        db.close()
+    result = _vesta_status_for_session_id(resolved)
+    if not result.get("active") and resolved != session_id:
+        fallback = _vesta_status_for_session_id(session_id)
+        if fallback.get("active"):
+            return fallback
+    return result
+
+
+@app.get("/api/vesta/runs")
+async def list_vesta_runs(limit: int = 20):
+    from vesta_runtime import run_status_from_dir
+
+    bounded = max(1, min(int(limit or 20), 100))
+    runs: List[Dict[str, Any]] = []
+    for run_dir in _iter_vesta_run_dirs()[:bounded]:
+        status = run_status_from_dir(run_dir)
+        if not status:
+            continue
+        runs.append(
+            {
+                "run_id": status.get("run_id"),
+                "run_dir": status.get("run_dir"),
+                "workspace_path": status.get("workspace_path"),
+                "finalization_status": status.get("finalization_status"),
+                "validator_status": status.get("validator_status"),
+                "next_action": status.get("next_action"),
+                "lineage": status.get("lineage"),
+            }
+        )
+    return {"runs": runs, "limit": bounded}
+
+
+@app.get("/api/vesta/runs/{run_id}/status")
+async def get_vesta_run_status(run_id: str):
+    from vesta_runtime import run_status_from_dir
+
+    for run_dir in _iter_vesta_run_dirs():
+        if run_dir.name != run_id:
+            continue
+        status = run_status_from_dir(run_dir)
+        if status:
+            return status
+    raise HTTPException(status_code=404, detail="Vesta run not found")
+
+
 @app.delete("/api/sessions/{session_id}")
 async def delete_session_endpoint(session_id: str):
     from hermes_state import SessionDB
@@ -3221,6 +3319,24 @@ def _resolve_chat_argv(
 
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
+
+    # The classic CLI config bridge intentionally maps local terminal cwd to
+    # the process cwd. Dashboard chat sometimes needs an explicit embedded-PTY
+    # workspace (for example copy-workspace QA), so allow a dashboard-specific
+    # override that survives that bridge and forward it to the TUI child.
+    terminal_cwd = str(
+        os.environ.get("HERMES_DASHBOARD_TERMINAL_CWD")
+        or env.get("TERMINAL_CWD")
+        or ""
+    ).strip()
+    if terminal_cwd:
+        try:
+            terminal_cwd_path = Path(terminal_cwd).expanduser()
+            if terminal_cwd_path.is_dir():
+                cwd = str(terminal_cwd_path)
+                env["TERMINAL_CWD"] = cwd
+        except OSError:
+            pass
 
     return list(argv), str(cwd) if cwd else None, env
 

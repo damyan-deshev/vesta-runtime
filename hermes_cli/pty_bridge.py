@@ -107,8 +107,9 @@ class PtyBridge:
             if ptyprocess is None:
                 raise PtyUnavailableError(
                     "The `ptyprocess` package is missing. "
-                    "Install with: pip install ptyprocess "
-                    "(or pip install -e '.[pty]')."
+                    "Install with: pip install -e '.[web,pty]' "
+                    "for the dashboard Chat tab, or pip install -e '.[pty]' "
+                    "if the web extra is already installed."
                 )
             raise PtyUnavailableError("Pseudo-terminals are unavailable.")
         # PTY-hosted programs expect TERM to describe the terminal type.

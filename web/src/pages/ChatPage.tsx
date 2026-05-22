@@ -788,7 +788,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar channel={channel} sessionIdHint={resumeParam} />
           </div>
         </div>
       </>,
@@ -855,7 +855,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar channel={channel} sessionIdHint={resumeParam} />
             </div>
           </div>
         )}

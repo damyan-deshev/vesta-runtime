@@ -103,6 +103,7 @@ class TestWebServerEndpoints:
     @pytest.fixture(autouse=True)
     def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
         """Create a TestClient and isolate the state DB under the test HERMES_HOME."""
+        pytest.importorskip("fastapi")
         try:
             from starlette.testclient import TestClient
         except ImportError:
@@ -124,6 +125,40 @@ class TestWebServerEndpoints:
         assert "version" in data
         assert "hermes_home" in data
         assert "active_sessions" in data
+
+    def test_vesta_session_and_run_status_endpoints_read_artifacts(self, tmp_path):
+        from vesta_runtime import create_run, set_current_run, write_finalization
+
+        set_current_run(None)
+        run = create_run(
+            session_id="web-session",
+            workspace_path=tmp_path,
+            run_id="run_web_status",
+        )
+        write_finalization(
+            objective="Expose Vesta status in dashboard.",
+            verification="No artifacts required.",
+            next_action="Inspect dashboard card.",
+            session_id="web-session",
+        )
+        set_current_run(None)
+
+        session_resp = self.client.get("/api/sessions/web-session/vesta")
+        assert session_resp.status_code == 200
+        session_data = session_resp.json()
+        assert session_data["active"] is True
+        assert session_data["status"]["run_id"] == "run_web_status"
+        assert session_data["status"]["finalization_status"] == "accepted"
+
+        runs_resp = self.client.get("/api/vesta/runs")
+        assert runs_resp.status_code == 200
+        assert any(item["run_id"] == "run_web_status" for item in runs_resp.json()["runs"])
+
+        status_resp = self.client.get(f"/api/vesta/runs/{run.run_id}/status")
+        assert status_resp.status_code == 200
+        status = status_resp.json()
+        assert status["run_id"] == "run_web_status"
+        assert status["next_action"] == "Inspect dashboard card."
 
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config
@@ -2066,6 +2101,29 @@ import sys
 skip_on_windows = pytest.mark.skipif(
     sys.platform.startswith("win"), reason="PTY bridge is POSIX-only"
 )
+
+
+def test_resolve_chat_argv_prefers_dashboard_terminal_cwd(monkeypatch, tmp_path):
+    import hermes_cli.main as main
+    import hermes_cli.web_server as ws
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    monkeypatch.setattr(
+        main,
+        "_make_tui_argv",
+        lambda _path, tui_dev=False: (["node", "dist/entry.js"], tui_dir),
+    )
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "server-cwd"))
+    monkeypatch.setenv("HERMES_DASHBOARD_TERMINAL_CWD", str(workspace))
+
+    argv, cwd, env = ws._resolve_chat_argv()
+
+    assert argv == ["node", "dist/entry.js"]
+    assert cwd == str(workspace)
+    assert env["TERMINAL_CWD"] == str(workspace)
 
 
 @skip_on_windows

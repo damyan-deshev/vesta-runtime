@@ -26,6 +26,15 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
+_VESTA_RUNTIME_TOOLS = [
+    "ledger_append", "ledger_status", "ledger_tail", "ledger_search",
+    "artifact_manifest_status", "run_status", "whole_document_read", "artifact_record",
+    "worker_state_record", "coding_eval_start", "coding_eval_capture",
+    "raw_ref_purge", "validator_result_record", "control_plane_snapshot",
+    "handoff_generate", "research_artifact_section_write", "finalize_run",
+]
+
+
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
@@ -51,11 +60,7 @@ _HERMES_CORE_TOOLS = [
     # Session history search
     "session_search",
     # Vesta durable runtime state
-    "ledger_append", "ledger_status", "ledger_tail", "ledger_search",
-    "artifact_manifest_status", "run_status", "whole_document_read", "artifact_record",
-    "worker_state_record", "coding_eval_start", "coding_eval_capture",
-    "raw_ref_purge", "validator_result_record", "control_plane_snapshot",
-    "handoff_generate", "research_artifact_section_write", "finalize_run",
+    *_VESTA_RUNTIME_TOOLS,
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -217,7 +222,13 @@ TOOLSETS = {
         "tools": ["session_search"],
         "includes": []
     },
-    
+
+    "vesta": {
+        "description": "Vesta durable runtime state, ledger, artifact, and finalization tools",
+        "tools": _VESTA_RUNTIME_TOOLS,
+        "includes": []
+    },
+
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
